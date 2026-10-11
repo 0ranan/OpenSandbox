@@ -23,6 +23,7 @@ import (
 
 	"github.com/alibaba/opensandbox/egress/pkg/credentialvault"
 	"github.com/alibaba/opensandbox/egress/pkg/log"
+	"github.com/alibaba/opensandbox/egress/pkg/mitmproxy"
 	"github.com/alibaba/opensandbox/egress/pkg/policy"
 	"github.com/alibaba/opensandbox/egress/pkg/revision"
 )
@@ -31,7 +32,7 @@ import (
 // experimental revision runtime. It installs a rendered candidate snapshot on
 // the receiver, reconciles an indeterminate outcome to its exact attempt, and
 // finalizes the public Store only after the exact identity is confirmed. It
-// does not provide transport drain acknowledgements or policy epoch updates;
+// does not wait for transport draining; it preserves the committed policy epoch;
 // connection draining is owned by the addon's decision registry deadlines.
 // prepare must only prepare a candidate from the supplied Store and policy; it
 // must not publish state or reenter policy/lifecycle methods. The caller must
@@ -77,7 +78,13 @@ func (s *policyServer) mutateRevisionVault(
 	if m.running == nil || m.revisionSession == nil || m.revisionOwner == nil || m.revisionOwner.stop == nil || s.mitmGate.MitmPending() {
 		return empty, revision.ErrTransportUnavailable
 	}
-	candidate, err := prepare(s.credentialVault, s.effectivePolicy())
+	if s.revisionRecovery == nil || s.revisionRecovery.current == nil {
+		return empty, revision.ErrInvalid
+	}
+	base := s.revisionRecovery.current
+	inputs := base.inputs
+	allow := append(append([]policy.EgressRule(nil), inputs.alwaysAllow...), inputs.telemetryAllow...)
+	candidate, err := prepare(s.credentialVault, policy.MergeAlwaysOverlay(inputs.user, inputs.alwaysDeny, allow))
 	if err != nil {
 		if candidate != nil {
 			candidate.Discard()
@@ -92,93 +99,111 @@ func (s *policyServer) mutateRevisionVault(
 	if err != nil {
 		return empty, revision.ErrInvalid
 	}
-	// Policy epoch remains the bootstrap-reserved zero until policy integration.
-	payload, err := credentialvault.MarshalDecisionSnapshot(snapshot, 0)
+	payload, err := credentialvault.MarshalDecisionSnapshot(snapshot, base.epoch)
 	if err != nil {
 		return empty, revision.ErrInvalid
 	}
 	digest := sha256.Sum256(payload)
 	session := m.revisionSession
-	detach := func() (credentialvault.State, error) {
-		s.mitmGate.SetReady(false)
-		// A terminal detach cannot prove the remote outcome, so it latches
-		// sticky recovery BEFORE detaching/stopping: no same-sidecar restart,
-		// every outstanding bootstrap ticket is fenced, nft is quiesced and
-		// quarantine contains. Known prepare rejection and an exact-previous
-		// reconcile are the only nonsticky outcomes and never reach here.
-		s.requireRevisionRecoveryLocked(revisionRecoveryExternalEffectsUnknown)
-		running := m.running
-		m.running, m.revisionSession = nil, nil
-		// Keep currentGen: the exact child's exit event is fenced by the same
-		// recovery latch, which any fresh bootstrap must wait on via s.mu.
-		// Concurrent shutdown also waits for this lease.
-		m.revisionOwner.stop(running)
-		// Close failures remain a failed transaction. Do not expose error text that
-		// may contain credentials or filesystem details, or restore readiness here.
-		// The detach latch already quiesced/contained; preserve its first reason.
-		if err := session.Close(); err != nil {
-			log.Warnf("revision vault mutation: session cleanup failed after detach")
-		}
+	config, err := session.MitmproxyConfig()
+	if err != nil || !validRevisionMutationConfig(config) {
+		s.detachRevisionMutationLocked(m)
 		return empty, revision.ErrTransportUnavailable
 	}
-	config, err := session.MitmproxyConfig()
-	if err != nil || config == nil {
-		return detach()
-	}
-	// Rendering can expand a valid API body beyond the IPC budget. Reject it
-	// before Update sends anything; this is not an uncertain remote effect.
+	// A rendered candidate can exceed the IPC budget even with a valid body.
 	if len(payload) > config.MaxSnapshotBytes {
 		return empty, revision.ErrInvalid
-	}
-	matches := func(id revision.Identity) bool {
-		return config.ControlGeneration != "" && config.SubjectGeneration != "" &&
-			id.ControlGeneration == config.ControlGeneration && id.SubjectGeneration == config.SubjectGeneration &&
-			id.DecisionEpoch > 0 && id.VaultRevision == snapshot.Revision && id.PolicyEpoch == 0 &&
-			id.Digest == hex.EncodeToString(digest[:])
 	}
 	if err := ctx.Err(); err != nil {
 		return empty, err
 	}
-	attempt, err := session.Update(ctx, snapshot, 0)
+	if err := updateRevisionSnapshotLocked(ctx, session, config, snapshot, base.epoch, hex.EncodeToString(digest[:])); err != nil {
+		if !errors.Is(err, revision.ErrPrepareRejected) {
+			s.detachRevisionMutationLocked(m)
+			return empty, revision.ErrTransportUnavailable
+		}
+		return empty, err
+	}
+	state, err := s.credentialVault.CommitCandidate(candidate)
+	if err != nil {
+		s.detachRevisionMutationLocked(m)
+		return empty, revision.ErrTransportUnavailable
+	}
+	return state, nil
+}
+
+// validRevisionMutationConfig checks the identity and payload limits used by
+// both mutation owners before any Policy file or kernel effect.
+func validRevisionMutationConfig(config *mitmproxy.RevisionIPCConfig) bool {
+	return config != nil && config.ControlGeneration != "" && config.SubjectGeneration != "" && config.MaxSnapshotBytes > 0
+}
+
+// updateRevisionSnapshotLocked installs one frozen snapshot and only reconciles
+// its exact attempt. The caller holds s.mu and m.mu, owns effect classification,
+// and publishes local state only after nil. A confirmed ACK wins over a later
+// context cancellation. No Store/base or lifecycle state is changed here.
+func updateRevisionSnapshotLocked(ctx context.Context, session revisionProcessSession, config *mitmproxy.RevisionIPCConfig,
+	snapshot credentialvault.ActiveSnapshot, epoch int64, digest string,
+) error {
+	matches := func(id revision.Identity) bool {
+		return id.ControlGeneration == config.ControlGeneration && id.SubjectGeneration == config.SubjectGeneration &&
+			id.DecisionEpoch > 0 && id.VaultRevision == snapshot.Revision && id.PolicyEpoch == epoch && id.Digest == digest
+	}
+	attempt, err := session.Update(ctx, snapshot, epoch)
 	if err != nil && !errors.Is(err, revision.ErrIndeterminate) {
 		if errors.Is(err, revision.ErrPrepareRejected) {
-			return empty, revision.ErrPrepareRejected
+			return revision.ErrPrepareRejected
 		}
-		return detach()
+		return revision.ErrTransportUnavailable
 	}
 	if !matches(attempt) {
-		return detach()
+		return revision.ErrTransportUnavailable
 	}
 	for err != nil {
 		if ctx.Err() != nil {
-			return detach()
+			return revision.ErrTransportUnavailable
 		}
 		var committed bool
 		committed, err = session.ReconcileUpdate(ctx, attempt)
 		if err == nil {
 			if !committed {
-				return empty, revision.ErrPrepareRejected
+				return revision.ErrPrepareRejected
 			}
 			break
 		}
 		if errors.Is(err, revision.ErrClosed) || errors.Is(err, revision.ErrTransportUnavailable) || errors.Is(err, revision.ErrInvalid) {
-			return detach()
+			return revision.ErrTransportUnavailable
 		}
-		// Do not spin on unavailable readback or send Update again. Reconcile only
-		// this exact attempt until confirmation or the caller's bounded deadline.
 		timer := time.NewTimer(10 * time.Millisecond)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return detach()
+			return revision.ErrTransportUnavailable
 		case <-timer.C:
 		}
 	}
-	state, err := s.credentialVault.CommitCandidate(candidate)
-	if err != nil {
-		return detach()
+	return nil
+}
+
+// detachRevisionMutationLocked retains both owner locks until the exact child
+// is stopped/reaped and its session closed. A helper may already have latched
+// and contained the failure; do not repeat quarantine in that case.
+func (s *policyServer) detachRevisionMutationLocked(m *mitmTransparent) {
+	s.mitmGate.SetReady(false)
+	if s.revisionRecovery.recoveryErrorLocked() == nil {
+		s.requireRevisionRecoveryLocked(revisionRecoveryExternalEffectsUnknown)
 	}
-	return state, nil
+	running, session := m.running, m.revisionSession
+	m.running, m.revisionSession = nil, nil
+	// Keep currentGen so the exact child's exit remains fenced by recovery.
+	if running != nil {
+		m.revisionOwner.stop(running)
+	}
+	if session != nil {
+		if err := session.Close(); err != nil {
+			log.Warnf("revision mutation: session cleanup failed after detach")
+		}
+	}
 }
 
 // errRevisionExpectedRevision carries the optimistic-concurrency conflict in

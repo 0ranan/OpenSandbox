@@ -91,7 +91,7 @@ func liveWriteDo(t *testing.T, s *policyServer, method, body string) *httptest.R
 
 func liveWriteCreate(t *testing.T, s *policyServer) {
 	t.Helper()
-	s.proxy = &stubProxy{updated: liveWritePolicy(t, true)}
+	setMutationFixturePolicy(t, s, liveWritePolicy(t, true))
 	response := liveWriteDo(t, s, http.MethodPost, liveWriteCreateBody())
 	require.Equal(t, http.StatusCreated, response.Code)
 }
@@ -156,7 +156,7 @@ func TestRevisionWriteHandlerDeleteAndRecreate(t *testing.T) {
 
 func TestRevisionWriteHandlerValidationFailureKeepsFixedVocabulary(t *testing.T) {
 	s, _, session := liveWriteFixture(t)
-	s.proxy = &stubProxy{updated: liveWritePolicy(t, false)}
+	setMutationFixturePolicy(t, s, liveWritePolicy(t, false))
 
 	// The binding host is not allowed by the policy: the prepare failure is
 	// sanitized and no session work happens.

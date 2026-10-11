@@ -241,14 +241,17 @@ func TestPolicyServerRevisionBootstrapSnapshotDistinguishesMissingAndEmpty(t *te
 		credentialVault: credentialvault.NewStore(nil, func() bool { return true }),
 	}
 
-	snapshot, policyEpoch, err := server.revisionBootstrapSnapshot(context.Background())
+	require.NoError(t, server.initRevisionRecoveryLocked(effectivePolicyInputs{user: policy.DefaultDenyPolicy()}))
+	snapshot, policyEpoch, _, err := server.captureRevisionBootstrap(context.Background())
 	require.NoError(t, err)
-	require.Equal(t, credentialvault.ActiveSnapshot{}, snapshot)
+	require.Zero(t, snapshot.Revision)
+	require.Empty(t, snapshot.Bindings)
+	require.Empty(t, snapshot.Redactions)
 	require.Zero(t, policyEpoch)
 
 	_, err = server.credentialVault.Create(credentialvault.CreateRequest{}, policy.DefaultDenyPolicy())
 	require.NoError(t, err)
-	snapshot, policyEpoch, err = server.revisionBootstrapSnapshot(context.Background())
+	snapshot, policyEpoch, _, err = server.captureRevisionBootstrap(context.Background())
 	require.NoError(t, err)
 	require.Equal(t, int64(1), snapshot.Revision)
 	require.Empty(t, snapshot.Bindings)

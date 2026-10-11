@@ -70,7 +70,8 @@ func mutationFixture(t *testing.T) (*policyServer, *mitmTransparent, *mutationTe
 	t.Setenv(constants.EnvMitmproxyTransparent, "true")
 	gate := mitmproxy.NewHealthGate()
 	gate.SetReady(true)
-	s := &policyServer{proxy: &stubProxy{}, mitmGate: gate, credentialVault: credentialvault.NewStore(nil, func() bool { return true })}
+	s := &policyServer{proxy: &stubProxy{updated: policy.DefaultDenyPolicy()}, mitmGate: gate, credentialVault: credentialvault.NewStore(nil, func() bool { return true })}
+	require.NoError(t, s.initRevisionRecoveryLocked(effectivePolicyInputs{user: s.proxy.CurrentPolicy()}))
 	session := &mutationTestSession{fakeRevisionProcessSession: fakeRevisionProcessSession{config: validFakeRevisionIPCConfig()}}
 	session.update = func(_ context.Context, snapshot credentialvault.ActiveSnapshot, epoch int64) (revision.Identity, error) {
 		return mutationIdentity(t, snapshot, epoch), nil
@@ -78,6 +79,16 @@ func mutationFixture(t *testing.T) (*policyServer, *mitmTransparent, *mutationTe
 	m := &mitmTransparent{running: &mitmproxy.Running{}, revisionSession: session, currentGen: 7, revisionOwner: &revisionLaunchOwner{stop: func(*mitmproxy.Running) { t.Error("unexpected stop") }}}
 	return s, m, session
 }
+
+// Test-only bootstrap setup. Runtime changes must use the real Policy owner.
+func setMutationFixturePolicy(t *testing.T, s *policyServer, pol *policy.NetworkPolicy) {
+	t.Helper()
+	s.proxy = &stubProxy{updated: pol}
+	base, err := newEffectivePolicyBase(effectivePolicyInputs{user: pol}, 0)
+	require.NoError(t, err)
+	s.revisionRecovery.current = base
+}
+
 func mutationContext(t *testing.T) context.Context {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -189,7 +200,7 @@ func TestRevisionVaultMutationNonemptyCreatePatchDeleteRecreate(t *testing.T) {
 	request := credentialvault.CreateRequest{Credentials: []credentialvault.Credential{{Name: "token", Source: []byte(`{"type":"inline","value":"private-original"}`)}}, Bindings: []credentialvault.Binding{{Name: "api", Match: credentialvault.Match{Hosts: []string{"api.example.com"}, Methods: []string{"GET"}, Paths: []string{"/v1/*"}}, Auth: credentialvault.Auth{Type: "apiKey", Name: "X-API-Key", Credential: "token"}}}}
 	pol, err := policy.ParsePolicy(`{"defaultAction":"allow"}`)
 	require.NoError(t, err)
-	s.proxy.(*stubProxy).updated = pol
+	setMutationFixturePolicy(t, s, pol)
 	create := func(store *credentialvault.Store, pol *policy.NetworkPolicy) (*credentialvault.MutationCandidate, error) {
 		return store.PrepareCreate(request, pol)
 	}
@@ -404,7 +415,7 @@ func TestRevisionVaultMutationCleanupHoldsPolicyAndLifecycleBarriers(t *testing.
 				case "session-close":
 					m.closeRevisionSession(7)
 				case "bootstrap":
-					_, _, _ = s.revisionBootstrapSnapshot(context.Background())
+					_, _, _, _ = s.captureRevisionBootstrap(context.Background())
 				case "vault-write":
 					_, _ = s.mutateRevisionVault(mutationContext(t), m, prepareEmptyVault)
 				case "policy-write":
@@ -543,7 +554,6 @@ func TestRevisionVaultMutationSanitizesCandidateAndSessionFailures(t *testing.T)
 func TestRevisionRecoveryMutationBlocked(t *testing.T) {
 	s, m, session := mutationFixture(t)
 	s.mu.Lock()
-	require.NoError(t, s.initRevisionRecoveryLocked(effectivePolicyInputs{user: policy.DefaultDenyPolicy()}))
 	s.requireRevisionRecoveryLocked(revisionRecoveryExternalEffectsUnknown)
 	s.mu.Unlock()
 	prepared := false
@@ -569,19 +579,13 @@ func (l *mutationWarningLogger) Warnf(format string, args ...any) {
 }
 
 func TestRevisionRecoveryCleanupFailure(t *testing.T) {
-	for _, kind := range []string{"clean", "cleanup-failed", "legacy-cleanup-failed"} {
+	for _, kind := range []string{"clean", "cleanup-failed"} {
 		t.Run(kind, func(t *testing.T) {
 			originalLogger := log.Logger
 			logger := &mutationWarningLogger{Logger: originalLogger}
 			log.Logger = logger
 			t.Cleanup(func() { log.Logger = originalLogger })
 			s, m, session := mutationFixture(t)
-			if kind != "legacy-cleanup-failed" {
-				s.mu.Lock()
-				err := s.initRevisionRecoveryLocked(effectivePolicyInputs{user: policy.DefaultDenyPolicy()})
-				s.mu.Unlock()
-				require.NoError(t, err)
-			}
 			running := m.running
 			events := []string{}
 			m.revisionOwner.stop = func(got *mitmproxy.Running) {
@@ -605,9 +609,8 @@ func TestRevisionRecoveryCleanupFailure(t *testing.T) {
 			require.NotContains(t, err.Error(), "private-cleanup-secret")
 			require.Equal(t, []string{"stop", "close"}, events)
 			require.True(t, s.mitmGate.MitmPending())
-			// Every terminal detach latches the unknown-effects recovery first,
-			// even without a prior recovery owner; a later cleanup failure can
-			// never replace that first classification.
+			// Every terminal detach latches unknown-effects recovery first; a
+			// later cleanup failure can never replace that first classification.
 			require.NotNil(t, s.revisionRecovery)
 			require.Equal(t, revisionRecoveryExternalEffectsUnknown, s.revisionRecovery.reason)
 			_, epoch, ticket, captureErr := s.captureRevisionBootstrap(context.Background())
@@ -618,7 +621,7 @@ func TestRevisionRecoveryCleanupFailure(t *testing.T) {
 			if kind == "clean" {
 				require.Empty(t, logger.warnings)
 			} else {
-				require.Equal(t, []string{"revision vault mutation: session cleanup failed after detach"}, logger.warnings)
+				require.Equal(t, []string{"revision mutation: session cleanup failed after detach"}, logger.warnings)
 			}
 		})
 	}
