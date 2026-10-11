@@ -41,7 +41,7 @@ COPY components/internal ./components/internal
 WORKDIR /workspace/components/egress
 
 # Static-ish build (no cgo by default) to simplify runtime deps.
-RUN test -z "${GOPROXY}" || go env -w GOPROXY="${GOPROXY}"; go mod download
+RUN test -z "${GOPROXY}" || go env -w GOPROXY="${GOPROXY}" && go mod download
 
 # Pre-download internal-module deps for the supervisor build below.
 RUN cd /workspace/components/internal && go mod download
@@ -86,8 +86,15 @@ ARG APT_MIRROR=
 
 # iptables is needed for DNS REDIRECT; ca-certificates for TLS to upstream resolvers
 RUN if [ -n "${APT_MIRROR}" ]; then \
+        set --; \
+        for source in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources; do \
+            if [ -f "$source" ]; then set -- "$@" "$source"; fi; \
+        done; \
+        if [ "$#" -eq 0 ]; then \
+            echo "APT_MIRROR requires a supported APT source file" >&2; exit 1; \
+        fi; \
         sed -i "s|deb.debian.org|${APT_MIRROR}|g; s|security.debian.org|${APT_MIRROR}|g" \
-            /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true; \
+            "$@"; \
     fi \
     && apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \

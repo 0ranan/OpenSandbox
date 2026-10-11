@@ -112,7 +112,8 @@ than copied into this page.
   runner convenience, unrelated to runtime DNS or Kubernetes evidence).
 - The Dockerfile build knobs `GOPROXY` and `APT_MIRROR` remain optional and
   empty by default; they are local-mirror conveniences for restricted build
-  networks only.
+  networks only. Override setup errors fail the build;
+  `APT_MIRROR` also requires at least one supported APT source file.
 
 ## Evidence hygiene
 

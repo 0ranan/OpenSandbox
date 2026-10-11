@@ -19,10 +19,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"strings"
 	"time"
 
 	"github.com/alibaba/opensandbox/egress/pkg/credentialvault"
+	"github.com/alibaba/opensandbox/egress/pkg/log"
 	"github.com/alibaba/opensandbox/egress/pkg/policy"
 	"github.com/alibaba/opensandbox/egress/pkg/revision"
 )
@@ -115,11 +115,9 @@ func (s *policyServer) mutateRevisionVault(
 		m.revisionOwner.stop(running)
 		// Close failures remain a failed transaction. Do not expose error text that
 		// may contain credentials or filesystem details, or restore readiness here.
-		// The detach latch already quiesced/contained, so a second latch attempt
-		// must not repeat those effects; it only fires when nothing latched yet.
-		if err := session.Close(); err != nil && s.revisionRecovery != nil &&
-			s.revisionRecovery.recoveryErrorLocked() == nil {
-			s.requireRevisionRecoveryLocked(revisionRecoverySessionCleanupFailed)
+		// The detach latch already quiesced/contained; preserve its first reason.
+		if err := session.Close(); err != nil {
+			log.Warnf("revision vault mutation: session cleanup failed after detach")
 		}
 		return empty, revision.ErrTransportUnavailable
 	}
@@ -197,7 +195,7 @@ func sanitizePrepareError(err error) error {
 		return credentialvault.ErrNotFound
 	case errors.Is(err, credentialvault.ErrExists):
 		return credentialvault.ErrExists
-	case strings.Contains(err.Error(), "expectedRevision"):
+	case errors.Is(err, credentialvault.ErrRevisionConflict):
 		return errRevisionExpectedRevision
 	default:
 		return revision.ErrInvalid

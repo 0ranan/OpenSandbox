@@ -19,6 +19,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -27,9 +28,11 @@ import (
 
 	"github.com/alibaba/opensandbox/egress/pkg/constants"
 	"github.com/alibaba/opensandbox/egress/pkg/credentialvault"
+	"github.com/alibaba/opensandbox/egress/pkg/log"
 	"github.com/alibaba/opensandbox/egress/pkg/mitmproxy"
 	"github.com/alibaba/opensandbox/egress/pkg/policy"
 	"github.com/alibaba/opensandbox/egress/pkg/revision"
+	slogger "github.com/alibaba/opensandbox/internal/logger"
 	"github.com/stretchr/testify/require"
 )
 
@@ -556,9 +559,22 @@ func TestRevisionRecoveryMutationBlocked(t *testing.T) {
 	require.True(t, s.mitmGate.MitmPending())
 }
 
+type mutationWarningLogger struct {
+	slogger.Logger
+	warnings []string
+}
+
+func (l *mutationWarningLogger) Warnf(format string, args ...any) {
+	l.warnings = append(l.warnings, fmt.Sprintf(format, args...))
+}
+
 func TestRevisionRecoveryCleanupFailure(t *testing.T) {
 	for _, kind := range []string{"clean", "cleanup-failed", "legacy-cleanup-failed"} {
 		t.Run(kind, func(t *testing.T) {
+			originalLogger := log.Logger
+			logger := &mutationWarningLogger{Logger: originalLogger}
+			log.Logger = logger
+			t.Cleanup(func() { log.Logger = originalLogger })
 			s, m, session := mutationFixture(t)
 			if kind != "legacy-cleanup-failed" {
 				s.mu.Lock()
@@ -599,6 +615,35 @@ func TestRevisionRecoveryCleanupFailure(t *testing.T) {
 			require.ErrorIs(t, captureErr, errRevisionRecoveryRequired)
 			require.Nil(t, ticket)
 			require.NotContains(t, captureErr.Error(), "private-cleanup-secret")
+			if kind == "clean" {
+				require.Empty(t, logger.warnings)
+			} else {
+				require.Equal(t, []string{"revision vault mutation: session cleanup failed after detach"}, logger.warnings)
+			}
+		})
+	}
+}
+
+func TestRevisionSanitizePrepareErrorClassification(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want error
+		code int
+	}{
+		{"conflict-without-expectedRevision-text", fmt.Errorf("private: %w", credentialvault.ErrRevisionConflict), errRevisionExpectedRevision, http.StatusConflict},
+		{"validation-with-expectedRevision-text", errors.New("private name expectedRevision"), revision.ErrInvalid, http.StatusBadRequest},
+		{"invalid", errors.New("private invalid data"), revision.ErrInvalid, http.StatusBadRequest},
+		{"not-found", fmt.Errorf("private: %w", credentialvault.ErrNotFound), credentialvault.ErrNotFound, http.StatusNotFound},
+		{"exists", fmt.Errorf("private: %w", credentialvault.ErrExists), credentialvault.ErrExists, http.StatusConflict},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := sanitizePrepareError(tc.err)
+			require.ErrorIs(t, err, tc.want)
+			response := httptest.NewRecorder()
+			writeRevisionMutationError(response, err)
+			require.Equal(t, tc.code, response.Code)
+			require.NotContains(t, response.Body.String(), "private")
 		})
 	}
 }
