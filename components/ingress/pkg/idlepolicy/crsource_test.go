@@ -17,7 +17,6 @@ package idlepolicy
 import (
 	"context"
 	"errors"
-	"strings"
 	"testing"
 	"time"
 
@@ -31,22 +30,17 @@ import (
 )
 
 // fakeDynamic satisfies dynamic.Interface for the one call the policy
-// source makes: a namespaced List of the Sandbox CR scoped by
-// metadata.name. The vendored dynamicfake indexes objects by a naive
-// pluralization of the kind ("sandboxs"), so it cannot serve the real
-// "sandboxes" resource.
+// source makes: a namespaced Get of the Sandbox CR. The vendored
+// dynamicfake indexes objects by a naive pluralization of the kind
+// ("sandboxs"), so it cannot serve the real "sandboxes" resource.
 type fakeDynamic struct {
-	objects  map[string]*unstructured.Unstructured
-	listErrs map[string]error
-	lists    map[string]int
+	objects map[string]*unstructured.Unstructured
+	getErrs map[string]error
+	gets    int
 }
 
 func newFakeDynamic() *fakeDynamic {
-	return &fakeDynamic{
-		objects:  map[string]*unstructured.Unstructured{},
-		listErrs: map[string]error{},
-		lists:    map[string]int{},
-	}
+	return &fakeDynamic{objects: map[string]*unstructured.Unstructured{}, getErrs: map[string]error{}}
 }
 
 func (f *fakeDynamic) Resource(schema.GroupVersionResource) dynamic.NamespaceableResourceInterface {
@@ -55,32 +49,15 @@ func (f *fakeDynamic) Resource(schema.GroupVersionResource) dynamic.Namespaceabl
 
 func (f *fakeDynamic) Namespace(string) dynamic.ResourceInterface { return f }
 
-func (f *fakeDynamic) List(_ context.Context, opts metav1.ListOptions) (*unstructured.UnstructuredList, error) {
-	name := fieldName(opts.FieldSelector)
-	f.lists[name]++
-	if err, ok := f.listErrs[name]; ok {
+func (f *fakeDynamic) Get(_ context.Context, name string, _ metav1.GetOptions, _ ...string) (*unstructured.Unstructured, error) {
+	f.gets++
+	if err, ok := f.getErrs[name]; ok {
 		return nil, err
 	}
-	out := &unstructured.UnstructuredList{}
-	for _, obj := range f.objects {
-		if name == "" || obj.GetName() == name {
-			out.Items = append(out.Items, *obj)
-		}
+	if obj, ok := f.objects[name]; ok {
+		return obj, nil
 	}
-	return out, nil
-}
-
-// fieldName extracts the value of "metadata.name=<v>" from a field selector.
-func fieldName(selector string) string {
-	const prefix = "metadata.name="
-	if value, ok := strings.CutPrefix(selector, prefix); ok {
-		return value
-	}
-	return ""
-}
-
-func (f *fakeDynamic) Get(context.Context, string, metav1.GetOptions, ...string) (*unstructured.Unstructured, error) {
-	return nil, errors.New("unsupported")
+	return nil, errors.New("not found")
 }
 
 func (f *fakeDynamic) Create(context.Context, *unstructured.Unstructured, metav1.CreateOptions, ...string) (*unstructured.Unstructured, error) {
@@ -101,6 +78,10 @@ func (f *fakeDynamic) Delete(context.Context, string, metav1.DeleteOptions, ...s
 
 func (f *fakeDynamic) DeleteCollection(context.Context, metav1.DeleteOptions, metav1.ListOptions) error {
 	return errors.New("unsupported")
+}
+
+func (f *fakeDynamic) List(context.Context, metav1.ListOptions) (*unstructured.UnstructuredList, error) {
+	return nil, errors.New("unsupported")
 }
 
 func (f *fakeDynamic) Watch(context.Context, metav1.ListOptions) (watch.Interface, error) {
@@ -158,7 +139,7 @@ func TestCRPolicySourceCachesUntilTTLAndFailsSafeOnAPIFailure(t *testing.T) {
 	require.True(t, source.WakeAllowed(context.Background(), "tenant-a", "sb-1"))
 
 	// Serve errors after the first read; the cached answer keeps holding.
-	client.listErrs["sb-1"] = errors.New("api server offline")
+	client.getErrs["sb-1"] = errors.New("api server offline")
 	require.True(t, source.WakeAllowed(context.Background(), "tenant-a", "sb-1"), "cache TTL keeps the last answer")
 
 	// A cache miss against a broken API denies (fail-safe), it never wakes.
