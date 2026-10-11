@@ -37,6 +37,13 @@ const DefaultCacheTTL = 30 * time.Second
 // misconfiguration must not turn into one GET per request.
 const failureBackoff = 2 * time.Second
 
+// Gate outcomes reported by ingress.idlep.policy.reads.
+const (
+	outcomeAllowed = "allowed"
+	outcomeDenied  = "denied"
+	outcomeError   = "error"
+)
+
 // PolicySource answers the wake gate for one sandbox; must fail safe.
 type PolicySource interface {
 	WakeAllowed(ctx context.Context, namespace, sandboxID string) bool
@@ -126,7 +133,7 @@ func (s *CRPolicySource) decide(ctx context.Context, namespace, sandboxID string
 	// Failure backoff: rate-limit retries without a sticky denial.
 	if at, ok := s.failures[key]; ok && s.now().Sub(at) < s.failureTTL {
 		s.mu.Unlock()
-		return false, "error"
+		return false, outcomeError
 	}
 	// Collapse the cold-cache stampede: one read per key, joiners wait.
 	if call, ok := s.inflight[key]; ok {
@@ -134,11 +141,11 @@ func (s *CRPolicySource) decide(ctx context.Context, namespace, sandboxID string
 		select {
 		case <-call.done:
 			if !call.ok {
-				return false, "error"
+				return false, outcomeError
 			}
 			return call.allowed, policyOutcome(call.allowed)
 		case <-ctx.Done():
-			return false, "error"
+			return false, outcomeError
 		}
 	}
 	call := &inflightRead{done: make(chan struct{})}
@@ -160,16 +167,16 @@ func (s *CRPolicySource) decide(ctx context.Context, namespace, sandboxID string
 	call.allowed, call.ok = allowed, ok
 	close(call.done)
 	if !ok {
-		return false, "error"
+		return false, outcomeError
 	}
 	return allowed, policyOutcome(allowed)
 }
 
 func policyOutcome(allowed bool) string {
 	if allowed {
-		return "allowed"
+		return outcomeAllowed
 	}
-	return "denied"
+	return outcomeDenied
 }
 
 func (s *CRPolicySource) fetch(ctx context.Context, namespace, sandboxID string) (allowed, ok bool) {
