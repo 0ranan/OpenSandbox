@@ -70,23 +70,28 @@ func newBackoff(cfg Config) *backoff {
 }
 
 func (b *backoff) next() time.Duration {
-	delay := time.Duration(float64(b.interval) * pow(b.factor, b.attempt))
+	// Grow and clamp in float64: pow overflows int64 around attempt ~100
+	// and the converted Duration can turn negative before any clamp.
 	b.attempt++
+	delay := float64(b.interval) * pow(b.factor, float64(b.attempt-1))
+	if max := float64(maxBackoffStep); delay > max {
+		delay = max
+	}
+	if min := float64(b.interval); delay < min {
+		delay = min
+	}
 	if b.jitter > 0 {
-		delay = time.Duration(float64(delay) * (1 + rand.Float64()*b.jitter)) //nolint:gosec // G404: jitter only, not security-sensitive
+		delay *= 1 + rand.Float64()*b.jitter //nolint:gosec // G404: jitter only, not security-sensitive
+		if delay > float64(maxBackoffStep) {
+			delay = float64(maxBackoffStep)
+		}
 	}
-	if delay < b.interval {
-		delay = b.interval
-	}
-	if delay > maxBackoffStep {
-		delay = maxBackoffStep
-	}
-	return delay
+	return time.Duration(delay)
 }
 
-func pow(base float64, exp int) float64 {
+func pow(base float64, exp float64) float64 {
 	result := 1.0
-	for range exp {
+	for ; exp >= 1; exp-- {
 		result *= base
 	}
 	return result

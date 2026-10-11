@@ -107,7 +107,11 @@ type wakeReplay struct {
 
 func newWakeReplay(proxy *Proxy, sw *statusCapturingResponseWriter, host *sandboxHost, r *http.Request, target sandbox.EndpointTarget) *wakeReplay {
 	c := &wakeReplay{statusCapturingResponseWriter: sw, proxy: proxy, host: host, r: r, target: target}
-	c.copied = captureBodyForReplay(r)
+	// Non-idempotent methods can never be replayed post-forward; skip the
+	// buffering and leave their body streaming untouched.
+	if wakeReplayMethods[r.Method] {
+		c.copied = captureBodyForReplay(r)
+	}
 	return c
 }
 

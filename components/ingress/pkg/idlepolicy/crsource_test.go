@@ -17,6 +17,7 @@ package idlepolicy
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -35,11 +36,17 @@ import (
 type fakeDynamic struct {
 	objects map[string]*unstructured.Unstructured
 	getErrs map[string]error
-	gets    int
+	gets    map[string]int
+	mu      sync.Mutex
+	delay   time.Duration
 }
 
 func newFakeDynamic() *fakeDynamic {
-	return &fakeDynamic{objects: map[string]*unstructured.Unstructured{}, getErrs: map[string]error{}}
+	return &fakeDynamic{
+		objects: map[string]*unstructured.Unstructured{},
+		getErrs: map[string]error{},
+		gets:    map[string]int{},
+	}
 }
 
 func (f *fakeDynamic) Resource(schema.GroupVersionResource) dynamic.NamespaceableResourceInterface {
@@ -49,7 +56,13 @@ func (f *fakeDynamic) Resource(schema.GroupVersionResource) dynamic.Namespaceabl
 func (f *fakeDynamic) Namespace(string) dynamic.ResourceInterface { return f }
 
 func (f *fakeDynamic) Get(_ context.Context, name string, _ metav1.GetOptions, _ ...string) (*unstructured.Unstructured, error) {
-	f.gets++
+	f.mu.Lock()
+	f.gets[name]++
+	delay := f.delay
+	f.mu.Unlock()
+	if delay > 0 {
+		time.Sleep(delay)
+	}
 	if err, ok := f.getErrs[name]; ok {
 		return nil, err
 	}
@@ -139,4 +152,38 @@ func TestCRPolicySourceCachesUntilTTLAndFailsSafeOnAPIFailure(t *testing.T) {
 	client.getErrs["sb-1"] = errors.New("api server offline")
 	require.True(t, source.WakeAllowed(context.Background(), "tenant-a", "sb-1"), "cache TTL keeps the last answer")
 	require.False(t, source.WakeAllowed(context.Background(), "tenant-a", "sb-2"))
+}
+
+func TestCRPolicySourceDoesNotCacheErrors(t *testing.T) {
+	// A transient API failure must not become a sticky denial for the TTL.
+	client := newFakeDynamic()
+	client.objects["sb-1"] = annotatedSandbox(t, map[string]string{AnnotationKey: `{"idleTimeoutSeconds":300,"onIdle":"pause"}`})
+	source := NewCRPolicySource(context.Background(), client, time.Minute)
+
+	client.getErrs["sb-1"] = errors.New("flaky")
+	require.False(t, source.WakeAllowed(context.Background(), "tenant-a", "sb-1"))
+
+	delete(client.getErrs, "sb-1")
+	require.True(t, source.WakeAllowed(context.Background(), "tenant-a", "sb-1"), "the failed read must not have been cached")
+}
+
+func TestCRPolicySourceCollapsesColdCacheReads(t *testing.T) {
+	client := newFakeDynamic()
+	client.objects["sb-1"] = annotatedSandbox(t, map[string]string{AnnotationKey: `{"idleTimeoutSeconds":300,"onIdle":"pause"}`})
+	source := NewCRPolicySource(context.Background(), client, time.Minute)
+
+	var wg sync.WaitGroup
+	results := make([]bool, 32)
+	for i := range results {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			results[i] = source.WakeAllowed(context.Background(), "tenant-a", "sb-1")
+		}(i)
+	}
+	wg.Wait()
+	for _, r := range results {
+		require.True(t, r)
+	}
+	require.Equal(t, 1, client.gets["sb-1"], "concurrent cold-cache reads must collapse to one GET")
 }

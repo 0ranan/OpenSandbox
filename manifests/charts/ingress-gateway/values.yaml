@@ -79,6 +79,9 @@ gateway:
     # -- Concurrent restore permits per replica (must be <= parkMax); a
     # flight holds its permit until the restore reaches a terminal outcome.
     restoreMax: 256
+    # -- Max lifetime of one wake flight; expiry releases the restore
+    # permit while the resume converges server-side.
+    maxFlightLifetime: "5m"
     # -- First readiness-poll interval of a wake flight.
     retryInterval: "50ms"
     # -- Exponential growth factor of the wake poll interval.

@@ -93,6 +93,7 @@ spec:
             - "--wake-park-budget={{ .Values.gateway.wake.parkBudget }}"
             - "--wake-park-max={{ .Values.gateway.wake.parkMax }}"
             - "--wake-restore-max={{ .Values.gateway.wake.restoreMax }}"
+            - "--wake-max-flight-lifetime={{ .Values.gateway.wake.maxFlightLifetime }}"
             - "--wake-retry-interval={{ .Values.gateway.wake.retryInterval }}"
             - "--wake-retry-factor={{ .Values.gateway.wake.retryFactor }}"
             - "--wake-retry-jitter={{ .Values.gateway.wake.retryJitter }}"

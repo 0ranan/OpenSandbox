@@ -37,15 +37,16 @@ type PolicySource interface {
 }
 
 // CRPolicySource reads the idle-policy annotation via a Kubernetes API GET
-// of the Sandbox CR, with a TTL cache.
+// of the Sandbox CR, with a TTL cache and per-key read collapsing.
 type CRPolicySource struct {
 	client dynamic.Interface
 	gvr    schema.GroupVersionResource
 	ttl    time.Duration
 	now    func() time.Time
 
-	mu    sync.Mutex
-	cache map[cacheKey]cacheEntry
+	mu       sync.Mutex
+	cache    map[cacheKey]cacheEntry
+	inflight map[cacheKey]*inflightRead
 }
 
 type cacheKey struct {
@@ -58,16 +59,27 @@ type cacheEntry struct {
 	at      time.Time
 }
 
+// inflightRead collapses concurrent cold-cache reads for one key.
+type inflightRead struct {
+	done    chan struct{}
+	allowed bool
+}
+
+// fetchTimeout bounds one API read; a hung apiserver must not hang the wake
+// path past the park budget.
+const fetchTimeout = 2 * time.Second
+
 func NewCRPolicySource(ctx context.Context, client dynamic.Interface, ttl time.Duration) *CRPolicySource {
 	if ttl <= 0 {
 		ttl = DefaultCacheTTL
 	}
 	s := &CRPolicySource{
-		client: client,
-		gvr:    SandboxGVR,
-		ttl:    ttl,
-		now:    time.Now,
-		cache:  make(map[cacheKey]cacheEntry),
+		client:   client,
+		gvr:      SandboxGVR,
+		ttl:      ttl,
+		now:      time.Now,
+		cache:    make(map[cacheKey]cacheEntry),
+		inflight: make(map[cacheKey]*inflightRead),
 	}
 	go s.runCacheJanitor(ctx)
 	return s
@@ -91,27 +103,51 @@ func (s *CRPolicySource) WakeAllowed(ctx context.Context, namespace, sandboxID s
 	key := cacheKey{namespace: namespace, sandboxID: sandboxID}
 	s.mu.Lock()
 	entry, ok := s.cache[key]
-	s.mu.Unlock()
 	if ok && s.now().Sub(entry.at) < s.ttl {
+		s.mu.Unlock()
 		return entry.allowed
 	}
-
-	allowed := s.fetch(ctx, namespace, sandboxID)
-
-	s.mu.Lock()
-	s.cache[key] = cacheEntry{allowed: allowed, at: s.now()}
+	// Collapse the cold-cache stampede: one read per key, joiners wait.
+	if call, ok := s.inflight[key]; ok {
+		s.mu.Unlock()
+		select {
+		case <-call.done:
+			return call.allowed
+		case <-ctx.Done():
+			return false
+		}
+	}
+	call := &inflightRead{done: make(chan struct{})}
+	s.inflight[key] = call
 	s.mu.Unlock()
+
+	allowed, ok := s.fetch(ctx, namespace, sandboxID)
+
+	// Cache successes only: a transient API error must not become a sticky
+	// denial for the TTL.
+	if ok {
+		s.mu.Lock()
+		s.cache[key] = cacheEntry{allowed: allowed, at: s.now()}
+		s.mu.Unlock()
+	}
+	s.mu.Lock()
+	delete(s.inflight, key)
+	s.mu.Unlock()
+	call.allowed = allowed
+	close(call.done)
 	return allowed
 }
 
-func (s *CRPolicySource) fetch(ctx context.Context, namespace, sandboxID string) bool {
+func (s *CRPolicySource) fetch(ctx context.Context, namespace, sandboxID string) (allowed, ok bool) {
 	// resourceVersion "0" = accepted-stale; the gate tolerates staleness by
-	// design, and any error resolves to "no policy".
+	// design.
+	ctx, cancel := context.WithTimeout(ctx, fetchTimeout)
+	defer cancel()
 	cr, err := s.client.Resource(s.gvr).Namespace(namespace).Get(ctx, sandboxID, metav1.GetOptions{ResourceVersion: "0"})
 	if err != nil {
-		return false
+		return false, false
 	}
-	return WakeAllowedOf(cr.GetAnnotations()[AnnotationKey])
+	return WakeAllowedOf(cr.GetAnnotations()[AnnotationKey]), true
 }
 
 func (s *CRPolicySource) runCacheJanitor(ctx context.Context) {

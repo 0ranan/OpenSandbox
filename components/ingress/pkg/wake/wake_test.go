@@ -539,12 +539,50 @@ func TestParkingLotReleaseIsIdempotent(t *testing.T) {
 	require.False(t, lot.tryAcquire())
 }
 
+func TestBackoffNeverOverflowsOrRegresses(t *testing.T) {
+	b := newBackoff(Config{RetryInterval: 50 * time.Millisecond, RetryFactor: 1.3, RetryJitter: 0.1})
+	for range 500 {
+		next := b.next()
+		require.GreaterOrEqual(t, next, 50*time.Millisecond)
+		require.LessOrEqual(t, next, maxBackoffStep)
+	}
+}
+
+func TestRestoreGaugeIsPairedPerFlight(t *testing.T) {
+	lifecycle := &scriptedLifecycle{
+		probes:     []probeCall{pausedProbe("ckpt-1"), readyProbe()},
+		resumeOut:  []sandbox.ResumeOutcome{sandbox.ResumeAccepted},
+		resumeErrs: []error{nil},
+	}
+	waker, _ := newTestWaker(t, Config{ParkBudget: 5 * time.Second, ParkMax: 8, RetryInterval: time.Millisecond}, lifecycle)
+
+	require.NoError(t, waker.Wake(context.Background(), wakeTarget))
+	require.Eventually(t, func() bool { return len(waker.permits) == 0 }, 2*time.Second, 5*time.Millisecond)
+}
+
+func TestFlightLifetimeCapsPollingAndFreesPermit(t *testing.T) {
+	lifecycle := &scriptedLifecycle{
+		probes:     []probeCall{pausedProbe("ckpt-1")},
+		resumeOut:  []sandbox.ResumeOutcome{sandbox.ResumeAccepted},
+		resumeErrs: []error{nil},
+	}
+	waker, _ := newTestWaker(t, Config{ParkBudget: 5 * time.Second, ParkMax: 8, MaxFlightLifetime: 50 * time.Millisecond, RetryInterval: 10 * time.Millisecond}, lifecycle)
+
+	_, _, err := waker.acquireFlight(context.Background(), wakeTarget, "ckpt-1")
+	require.NoError(t, err)
+	require.Equal(t, 1, len(waker.permits))
+
+	// The lifetime expires, the flight finishes, and the permit is freed
+	// even though the sandbox never became Ready.
+	require.Eventually(t, func() bool { return len(waker.permits) == 0 }, 2*time.Second, 5*time.Millisecond)
+}
+
 func TestBackoffScheduleGrowsAndJitters(t *testing.T) {
 	b := newBackoff(Config{RetryInterval: 50 * time.Millisecond, RetryFactor: 1.3, RetryJitter: 0.1})
 	previous := time.Duration(0)
 	for attempt := range 5 {
 		next := b.next()
-		base := time.Duration(float64(50*time.Millisecond) * pow(1.3, attempt))
+		base := time.Duration(float64(50*time.Millisecond) * pow(1.3, float64(attempt)))
 		require.GreaterOrEqual(t, next, base)
 		require.LessOrEqual(t, next, time.Duration(float64(base)*1.1)+time.Millisecond)
 		require.Greater(t, next, previous)

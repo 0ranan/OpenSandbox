@@ -431,6 +431,16 @@ func TestCaptureBodyForReplayShortCircuitsAndBuffers(t *testing.T) {
 	})
 }
 
+func TestWakeReplaySkipsCaptureForNonIdempotentMethods(t *testing.T) {
+	request := httptest.NewRequest(http.MethodPost, "http://ingress/exec", strings.NewReader("hello"))
+	replay := newWakeReplay(nil, &statusCapturingResponseWriter{ResponseWriter: httptest.NewRecorder()}, nil, request, sandbox.EndpointTarget{})
+	require.False(t, replay.replayable())
+	// The body was never consumed: it forwards untouched.
+	payload, err := io.ReadAll(request.Body)
+	require.NoError(t, err)
+	require.Equal(t, "hello", string(payload))
+}
+
 type failingReader struct{}
 
 func (failingReader) Read([]byte) (int, error) { return 0, errors.New("connection reset") }

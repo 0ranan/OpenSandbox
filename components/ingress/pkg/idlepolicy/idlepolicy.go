@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 )
 
@@ -42,14 +43,24 @@ type Policy struct {
 	ActiveProbe        json.RawMessage `json:"activeProbe,omitempty"`
 }
 
-// Parse decodes and validates one annotation value; unknown fields are
-// rejected.
+// Parse decodes and validates one annotation value; unknown fields,
+// trailing data, and JSON null are rejected.
 func Parse(raw string) (Policy, error) {
+	// "null" decodes into the zero value without error and would otherwise
+	// flip the gate open via the defaulting path — an implicit opt-in.
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "null" {
+		return Policy{}, errors.New("idlepolicy: empty policy")
+	}
 	var policy Policy
 	decoder := json.NewDecoder(strings.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&policy); err != nil {
 		return Policy{}, fmt.Errorf("idlepolicy: decode %s: %w", AnnotationKey, err)
+	}
+	// Only trailing whitespace may follow the object.
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return Policy{}, errors.New("idlepolicy: trailing data")
 	}
 	if policy.IdleTimeoutSeconds == nil {
 		if policy.OnIdle != "" {

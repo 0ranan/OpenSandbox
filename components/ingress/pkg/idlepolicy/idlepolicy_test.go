@@ -46,6 +46,11 @@ func TestParseFailsSafe(t *testing.T) {
 		"onIdle alone":        `{"onIdle":"pause"}`,
 		"threshold alone":     `{"idleTimeoutSeconds":300}`,
 		"wrong type":          `{"idleTimeoutSeconds":"300","onIdle":"pause"}`,
+		"json null":           `null`,
+		"empty":               ``,
+		"whitespace":          `   `,
+		"trailing garbage":    `{"wakeOnAccess":true} garbage`,
+		"trailing object":     `{"wakeOnAccess":true}{"wakeOnAccess":true}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := Parse(raw)

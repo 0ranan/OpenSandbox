@@ -42,12 +42,13 @@ var (
 )
 
 const (
-	DefaultParkBudget    = 5 * time.Second
-	DefaultParkMax       = 1024
-	DefaultRestoreMax    = 256
-	DefaultRetryInterval = 50 * time.Millisecond
-	DefaultRetryFactor   = 1.3
-	DefaultRetryJitter   = 0.1
+	DefaultParkBudget     = 5 * time.Second
+	DefaultParkMax        = 1024
+	DefaultRestoreMax     = 256
+	DefaultFlightLifetime = 5 * time.Minute
+	DefaultRetryInterval  = 50 * time.Millisecond
+	DefaultRetryFactor    = 1.3
+	DefaultRetryJitter    = 0.1
 )
 
 // Config bounds the wake path; it maps onto the --wake-* flags.
@@ -60,6 +61,9 @@ type Config struct {
 	// RestoreMax bounds concurrent resume flights (permits are held to
 	// flight terminal). Must not exceed ParkMax.
 	RestoreMax int
+	// MaxFlightLifetime bounds one flight's establish+poll phase; a stuck
+	// restore releases its permit at expiry instead of holding it forever.
+	MaxFlightLifetime time.Duration
 	// RetryInterval is the first poll interval, grown by RetryFactor with
 	// up to RetryJitter relative jitter.
 	RetryInterval time.Duration
@@ -130,8 +134,16 @@ func NewWaker(cfg Config, lifecycle Lifecycle, activity ActivityWriter, policy P
 	if cfg.RestoreMax <= 0 {
 		cfg.RestoreMax = DefaultRestoreMax
 	}
+	// An unset RestoreMax defers to an explicit smaller park bound instead
+	// of failing startup; an explicitly conflicting pair is still an error.
+	if cfg.RestoreMax == DefaultRestoreMax && cfg.RestoreMax > cfg.ParkMax {
+		cfg.RestoreMax = cfg.ParkMax
+	}
 	if cfg.RestoreMax > cfg.ParkMax {
 		return nil, fmt.Errorf("wake: restore permits (%d) cannot exceed the parking lot capacity (%d)", cfg.RestoreMax, cfg.ParkMax)
+	}
+	if cfg.MaxFlightLifetime <= 0 {
+		cfg.MaxFlightLifetime = DefaultFlightLifetime
 	}
 	if cfg.RetryInterval <= 0 {
 		cfg.RetryInterval = DefaultRetryInterval
@@ -248,6 +260,7 @@ func (w *Waker) acquireFlight(ctx context.Context, target sandbox.EndpointTarget
 	}
 	w.flights.flights[key] = f
 	w.flights.mu.Unlock()
+	telemetry.RecordRestoreDelta(1)
 	// Background context: budget exhaustion or client disconnect must not
 	// cancel the resume.
 	go f.run(checkpointID)

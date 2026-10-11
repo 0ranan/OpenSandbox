@@ -30,9 +30,10 @@ type flightKey struct {
 	sandboxID string
 }
 
-// flight is one per-sandbox resume attempt: at most one concurrent
-// ResumeSandbox per replica per sandbox; all parked requests share its
-// outcome and remaining budget.
+// flight is one per-sandbox resume attempt: while its budget is live it is
+// the only flight for the sandbox on this replica, and all parked requests
+// share its outcome and remaining budget. A flight past its budget may
+// still be polling toward terminal (permit held) alongside a newer one.
 type flight struct {
 	key      flightKey
 	target   sandbox.EndpointTarget
@@ -85,14 +86,16 @@ func (f *flight) finish(err error) {
 
 // run executes the resume flight to a terminal outcome on a background
 // context: never canceled by budget, disconnect, or slot release, so the
-// permit it holds bounds actual restores.
+// permit it holds bounds actual restores. MaxFlightLifetime caps the whole
+// phase so a stuck restore frees its permit instead of holding it forever.
 func (f *flight) run(checkpointID string) {
 	defer func() {
 		f.waker.releasePermit()
 		telemetry.RecordRestoreDelta(-1)
 	}()
 
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), f.waker.cfg.MaxFlightLifetime)
+	defer cancel()
 	w := f.waker
 	backoff := newBackoff(w.cfg)
 

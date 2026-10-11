@@ -17,6 +17,7 @@ package proxy
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 
 	"github.com/alibaba/opensandbox/ingress/pkg/sandbox"
@@ -79,9 +80,30 @@ func respondWakeTimeout(w http.ResponseWriter, err error) bool {
 }
 
 // stripWakeMarkerObserver removes the gateway-owned marker from upstream
-// responses.
+// responses. Trailers are filled after ModifyResponse (at body EOF), so the
+// body is wrapped to delete the key again there — otherwise a sandbox could
+// forge the marker in a trailer.
 func stripWakeMarkerObserver() func(*http.Response) {
 	return func(response *http.Response) {
 		response.Header.Del(WakeMarkerHeader)
+		if response.Trailer != nil {
+			response.Trailer.Del(WakeMarkerHeader)
+		}
+		if response.Body != nil {
+			response.Body = &trailerStripper{ReadCloser: response.Body, resp: response}
+		}
 	}
+}
+
+type trailerStripper struct {
+	io.ReadCloser
+	resp *http.Response
+}
+
+func (t *trailerStripper) Read(p []byte) (int, error) {
+	n, err := t.ReadCloser.Read(p)
+	if err == io.EOF && t.resp.Trailer != nil {
+		t.resp.Trailer.Del(WakeMarkerHeader)
+	}
+	return n, err
 }

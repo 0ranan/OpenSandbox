@@ -207,8 +207,9 @@ func newWakeOption(ctx context.Context, fsbProvider *sandbox.FastSandboxProvider
 	waker, err := wake.NewWaker(wake.Config{
 		ParkBudget:    flag.WakeParkBudget,
 		ParkMax:       flag.WakeParkMax,
-		RestoreMax:    flag.WakeRestoreMax,
-		RetryInterval: flag.WakeRetryInterval,
+		RestoreMax:         flag.WakeRestoreMax,
+		MaxFlightLifetime:  flag.WakeMaxFlightLifetime,
+		RetryInterval:      flag.WakeRetryInterval,
 		RetryFactor:   flag.WakeRetryFactor,
 		RetryJitter:   flag.WakeRetryJitter,
 	}, fsbProvider, activityWriter, policySource)
