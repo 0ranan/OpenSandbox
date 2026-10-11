@@ -788,6 +788,25 @@ SDK-created HTTP clients enforce NIST 2030 minimum TLS certificate strength by d
 `CreateSandbox` reports create latency to `POST /v1/metrics/events` by default. Set `ConnectionConfig.DisableMetrics` or `OPENSANDBOX_DISABLE_METRICS=1` to opt out. See [SDK Telemetry](/sdks/observability#creation-metrics).
 :::
 
+### Follow redirects
+
+The Go SDK retains Go's standard redirect behavior, including for file uploads
+and downloads. On redirects to a different origin (scheme, hostname, or effective
+port), it removes all headers whose names start with `OPEN-SANDBOX-` or
+`OPENSANDBOX-`, case-insensitively. Each redirect destination is compared with
+the initial request's origin, so subsequent hops on another origin remain
+protected. Same-origin redirects retain these headers. Unrelated custom headers
+continue to follow Go's standard forwarding rules.
+
+This protection applies to lifecycle, execd, egress, file transfers, and SSE
+requests. A custom `http.Client.CheckRedirect` supplied through `WithHTTPClient`
+or `ConnectionConfig.HTTPClient` still controls whether redirects are followed;
+the SDK removes protected headers after that callback runs, even if the callback
+adds them again. The SDK copies the supplied HTTP client rather than modifying it.
+HTTP and HTTPS default ports are treated as equivalent to explicit ports 80 and
+443 respectively. Upload method conversion and body replay follow Go's existing
+rules; this protection does not enable replay of streaming multipart bodies.
+
 ## Error Handling
 
 Non-2xx responses are returned as `*opensandbox.APIError`:
