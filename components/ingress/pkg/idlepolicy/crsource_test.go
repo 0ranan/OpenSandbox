@@ -29,10 +29,9 @@ import (
 	"k8s.io/client-go/dynamic"
 )
 
-// fakeDynamic satisfies dynamic.Interface for the one call the policy
-// source makes: a namespaced Get of the Sandbox CR. The vendored
-// dynamicfake indexes objects by a naive pluralization of the kind
-// ("sandboxs"), so it cannot serve the real "sandboxes" resource.
+// fakeDynamic satisfies dynamic.Interface; the vendored dynamicfake
+// indexes objects by naive pluralization ("sandboxs") and cannot serve the
+// real "sandboxes" resource.
 type fakeDynamic struct {
 	objects map[string]*unstructured.Unstructured
 	getErrs map[string]error
@@ -127,7 +126,6 @@ func TestCRPolicySourceReadsAnnotation(t *testing.T) {
 	require.True(t, source.WakeAllowed(context.Background(), "tenant-a", "sb-1"))
 	require.False(t, source.WakeAllowed(context.Background(), "tenant-a", "sb-denied"))
 	require.False(t, source.WakeAllowed(context.Background(), "tenant-a", "sb-unpoliced"))
-	// Unknown sandbox (NotFound): fail-safe deny.
 	require.False(t, source.WakeAllowed(context.Background(), "tenant-a", "missing"))
 }
 
@@ -138,10 +136,7 @@ func TestCRPolicySourceCachesUntilTTLAndFailsSafeOnAPIFailure(t *testing.T) {
 
 	require.True(t, source.WakeAllowed(context.Background(), "tenant-a", "sb-1"))
 
-	// Serve errors after the first read; the cached answer keeps holding.
 	client.getErrs["sb-1"] = errors.New("api server offline")
 	require.True(t, source.WakeAllowed(context.Background(), "tenant-a", "sb-1"), "cache TTL keeps the last answer")
-
-	// A cache miss against a broken API denies (fail-safe), it never wakes.
 	require.False(t, source.WakeAllowed(context.Background(), "tenant-a", "sb-2"))
 }

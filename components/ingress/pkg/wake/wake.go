@@ -57,9 +57,8 @@ type Config struct {
 	ParkBudget time.Duration
 	// ParkMax bounds concurrently parked requests per replica.
 	ParkMax int
-	// RestoreMax bounds concurrent resume flights; a flight holds its
-	// permit until terminal, so this bounds actual restores. Must not
-	// exceed ParkMax.
+	// RestoreMax bounds concurrent resume flights (permits are held to
+	// flight terminal). Must not exceed ParkMax.
 	RestoreMax int
 	// RetryInterval is the first poll interval, grown by RetryFactor with
 	// up to RetryJitter relative jitter.
@@ -81,8 +80,7 @@ type ActivityWriter interface {
 	Record(namespace, sandboxID string)
 }
 
-// PolicySource answers the per-sandbox wake gate: only sandboxes that
-// opted in via lifecycle.idlePolicy may be woken. Must fail safe — every
+// PolicySource answers the per-sandbox wake gate; must fail safe — every
 // error resolves to false.
 type PolicySource interface {
 	WakeAllowed(ctx context.Context, namespace, sandboxID string) bool
@@ -183,9 +181,8 @@ func (w *Waker) Wake(ctx context.Context, target sandbox.EndpointTarget) error {
 		return fmt.Errorf("%w: sandbox runtime is %s", sandbox.ErrSandboxNotReady, probe.RuntimeState)
 	}
 
-	// Opt-in gate: a paused sandbox without a wake policy keeps today's
-	// permanent 503, and no ResumeSandbox is ever issued for it. Runs
-	// before admission so denial consumes no slot and no permit.
+	// Opt-in gate: no policy keeps today's permanent 503. Runs before
+	// admission so denial consumes no slot and no permit.
 	if !w.policy.WakeAllowed(ctx, target.Namespace, target.SandboxID) {
 		return fmt.Errorf("%w: sandbox is paused without a wake-on-access policy", sandbox.ErrSandboxNotReady)
 	}
@@ -215,9 +212,9 @@ func (w *Waker) Wake(ctx context.Context, target sandbox.EndpointTarget) error {
 	return waitErr
 }
 
-// acquireFlight returns the sandbox's active flight, creating it under a
-// restore permit when none is running. A starter without a free permit
-// queues FIFO, bounded by its own budget; joiners take no permit.
+// acquireFlight returns the active flight, creating it under a restore
+// permit when none is running; a queued starter is bounded by its own
+// budget, and joiners take no permit.
 func (w *Waker) acquireFlight(ctx context.Context, target sandbox.EndpointTarget, checkpointID string) (*flight, bool, error) {
 	key := flightKey{namespace: target.Namespace, sandboxID: target.SandboxID}
 	if existing := w.flights.lookup(key); existing != nil {
@@ -257,8 +254,7 @@ func (w *Waker) acquireFlight(ctx context.Context, target sandbox.EndpointTarget
 	return f, false, nil
 }
 
-// releasePermit hands one permit back; guarded so a double release cannot
-// over-credit the pool.
+// releasePermit hands one permit back; a double release cannot over-credit.
 func (w *Waker) releasePermit() {
 	select {
 	case <-w.permits:

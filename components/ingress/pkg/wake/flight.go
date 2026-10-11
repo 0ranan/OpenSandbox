@@ -84,9 +84,8 @@ func (f *flight) finish(err error) {
 }
 
 // run executes the resume flight to a terminal outcome on a background
-// context. It is never canceled — not by the park budget, client
-// disconnects, or slot release — and holds its restore permit throughout,
-// so the permit bounds actual restores.
+// context: never canceled by budget, disconnect, or slot release, so the
+// permit it holds bounds actual restores.
 func (f *flight) run(checkpointID string) {
 	defer func() {
 		f.waker.releasePermit()
@@ -158,7 +157,7 @@ func (f *flight) establishResume(ctx context.Context, backoff *backoff, checkpoi
 	}
 }
 
-// pollUntilReady polls until Ready or terminal. The park budget bounds the
+// pollUntilReady polls until Ready or terminal; the park budget bounds the
 // waiters, never this loop.
 func (f *flight) pollUntilReady(ctx context.Context, backoff *backoff) {
 	w := f.waker
@@ -206,9 +205,8 @@ type flightRegistry struct {
 	flights map[flightKey]*flight
 }
 
-// lookup returns the flight that may absorb a new arrival, or nil. A
-// flight whose budget elapsed stops absorbing joiners but may still be
-// running toward terminal; remove's identity check keeps both straight.
+// lookup returns the flight that may absorb a new arrival, or nil: a
+// flight whose budget elapsed no longer absorbs joiners.
 func (r *flightRegistry) lookup(key flightKey) *flight {
 	r.mu.Lock()
 	defer r.mu.Unlock()

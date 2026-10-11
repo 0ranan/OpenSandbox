@@ -26,19 +26,15 @@ import (
 const (
 	// WakeMarkerHeader is gateway-owned: the proxy strips it from upstream
 	// responses, so its presence proves the gateway never forwarded the
-	// request. The stale-route re-entry 503 (post-forward) stays bare.
-	WakeMarkerHeader = "OpenSandbox-Wake"
-	// WakeMarkerExpired marks a parked request whose budget elapsed.
-	WakeMarkerExpired = "expired"
-	// WakeTimeoutCode is the machine-readable body form of the marker.
-	WakeTimeoutCode = "sandbox_wake_timeout"
-	// WakeTimeoutMessage is the fixed human-readable message.
+	// request. Post-forward answers stay bare.
+	WakeMarkerHeader   = "OpenSandbox-Wake"
+	WakeMarkerExpired  = "expired"
+	WakeTimeoutCode    = "sandbox_wake_timeout"
 	WakeTimeoutMessage = "restore still in progress; request was never forwarded and is safe to retry"
 )
 
-// wakeGateError carries the wake target on pre-forward parking errors so
-// the marked response can name the sandbox. Only pre-forward parking wraps
-// errors in it, which is what keeps the marker off post-forward answers.
+// wakeGateError wraps pre-forward parking errors with the wake target; its
+// presence is what keeps the marker off post-forward answers.
 type wakeGateError struct {
 	target sandbox.EndpointTarget
 	err    error
@@ -59,7 +55,7 @@ type wakeTimeoutErrorBody struct {
 }
 
 // respondWakeTimeout writes the marked wake-timeout 503 for a pre-forward
-// park-budget exhaustion and reports whether it did.
+// park-budget exhaustion; reports whether it did.
 func respondWakeTimeout(w http.ResponseWriter, err error) bool {
 	var gate *wakeGateError
 	if !errors.As(err, &gate) || !errors.Is(err, wake.ErrBudgetExhausted) {
@@ -83,7 +79,7 @@ func respondWakeTimeout(w http.ResponseWriter, err error) bool {
 }
 
 // stripWakeMarkerObserver removes the gateway-owned marker from upstream
-// responses so a sandbox cannot forge wake provenance.
+// responses.
 func stripWakeMarkerObserver() func(*http.Response) {
 	return func(response *http.Response) {
 		response.Header.Del(WakeMarkerHeader)

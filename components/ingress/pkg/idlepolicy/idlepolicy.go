@@ -12,11 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package idlepolicy reads the per-sandbox idle policy gating OSEP-0024
-// auto-pause and wake-on-access, persisted by the server as the
-// sandbox.opensandbox.io/idle-policy annotation on the fast-sandbox Sandbox
-// CR. Parsing fails safe: anything missing, malformed, or out of range is
-// treated as no policy.
+// Package idlepolicy parses the per-sandbox idle policy gating OSEP-0024
+// wake-on-access, carried as the sandbox.opensandbox.io/idle-policy
+// annotation on the fast-sandbox Sandbox CR. Parsing fails safe: anything
+// invalid is treated as no policy.
 package idlepolicy
 
 import (
@@ -29,15 +28,13 @@ import (
 // AnnotationKey carries the JSON-encoded idle policy on the Sandbox CR.
 const AnnotationKey = "sandbox.opensandbox.io/idle-policy"
 
-// Idle action and threshold bounds.
 const (
 	OnIdlePause           = "pause"
 	MinIdleTimeoutSeconds = 30
 	MaxIdleTimeoutSeconds = 86400
 )
 
-// Policy mirrors the create-time lifecycle.idlePolicy object. ActiveProbe
-// is opaque here: the sweeper owns probe execution.
+// Policy mirrors the create-time lifecycle.idlePolicy object.
 type Policy struct {
 	IdleTimeoutSeconds *int            `json:"idleTimeoutSeconds,omitempty"`
 	OnIdle             string          `json:"onIdle,omitempty"`
@@ -45,8 +42,8 @@ type Policy struct {
 	ActiveProbe        json.RawMessage `json:"activeProbe,omitempty"`
 }
 
-// Parse decodes and validates one annotation value. Unknown fields are
-// rejected so an older consumer fails safe instead of guessing.
+// Parse decodes and validates one annotation value; unknown fields are
+// rejected.
 func Parse(raw string) (Policy, error) {
 	var policy Policy
 	decoder := json.NewDecoder(strings.NewReader(raw))
@@ -74,8 +71,7 @@ func Parse(raw string) (Policy, error) {
 }
 
 // WakeAllowedOf reports whether raw permits wake-on-access; every parse
-// failure resolves to false. wakeOnAccess defaults to true within a
-// declared policy.
+// failure resolves to false. wakeOnAccess defaults to true.
 func WakeAllowedOf(raw string) bool {
 	policy, err := Parse(raw)
 	if err != nil {

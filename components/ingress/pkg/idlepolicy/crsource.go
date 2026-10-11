@@ -28,8 +28,7 @@ import (
 // SandboxGVR is the fast-sandbox Sandbox CR the annotation lives on.
 var SandboxGVR = schema.GroupVersionResource{Group: "sandbox.fast.io", Version: "v1alpha2", Resource: "sandboxes"}
 
-// DefaultCacheTTL bounds one CR read; it collapses joiner bursts and is
-// the policy-update propagation delay.
+// DefaultCacheTTL bounds one CR read.
 const DefaultCacheTTL = 30 * time.Second
 
 // PolicySource answers the wake gate for one sandbox; must fail safe.
@@ -37,9 +36,8 @@ type PolicySource interface {
 	WakeAllowed(ctx context.Context, namespace, sandboxID string) bool
 }
 
-// CRPolicySource reads the idle-policy annotation via a direct Kubernetes
-// API GET of the Sandbox CR (only on wake attempts, never the routing hot
-// path), with a TTL cache.
+// CRPolicySource reads the idle-policy annotation via a Kubernetes API GET
+// of the Sandbox CR, with a TTL cache.
 type CRPolicySource struct {
 	client dynamic.Interface
 	gvr    schema.GroupVersionResource
@@ -76,7 +74,7 @@ func NewCRPolicySource(ctx context.Context, client dynamic.Interface, ttl time.D
 }
 
 // NewInClusterCRPolicySource builds a CRPolicySource from the
-// environment's Kubernetes credentials. Requires get on the Sandbox CR.
+// environment's Kubernetes credentials.
 func NewInClusterCRPolicySource(ctx context.Context) (*CRPolicySource, error) {
 	cfg := injection.ParseAndGetRESTConfigOrDie()
 	cfg.UserAgent = "opensandbox-ingress-idlepolicy"
@@ -88,8 +86,7 @@ func NewInClusterCRPolicySource(ctx context.Context) (*CRPolicySource, error) {
 }
 
 // WakeAllowed reports whether the sandbox's policy permits wake-on-access;
-// unreadable CR, missing annotation, and unparseable policy all resolve to
-// false.
+// every failure resolves to false.
 func (s *CRPolicySource) WakeAllowed(ctx context.Context, namespace, sandboxID string) bool {
 	key := cacheKey{namespace: namespace, sandboxID: sandboxID}
 	s.mu.Lock()
@@ -108,10 +105,8 @@ func (s *CRPolicySource) WakeAllowed(ctx context.Context, namespace, sandboxID s
 }
 
 func (s *CRPolicySource) fetch(ctx context.Context, namespace, sandboxID string) bool {
-	// resourceVersion "0" ("Any") lets the apiserver serve the read from its
-	// watch cache where supported; the gate tolerates staleness by design
-	// (TTL). An error — NotFound, RBAC, API downtime — degrades to "no
-	// policy": a delayed wake, never a wrong one.
+	// resourceVersion "0" = accepted-stale; the gate tolerates staleness by
+	// design, and any error resolves to "no policy".
 	cr, err := s.client.Resource(s.gvr).Namespace(namespace).Get(ctx, sandboxID, metav1.GetOptions{ResourceVersion: "0"})
 	if err != nil {
 		return false
@@ -119,7 +114,6 @@ func (s *CRPolicySource) fetch(ctx context.Context, namespace, sandboxID string)
 	return WakeAllowedOf(cr.GetAnnotations()[AnnotationKey])
 }
 
-// runCacheJanitor drops expired entries.
 func (s *CRPolicySource) runCacheJanitor(ctx context.Context) {
 	ticker := time.NewTicker(s.ttl * 2)
 	defer ticker.Stop()

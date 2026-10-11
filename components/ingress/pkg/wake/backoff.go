@@ -47,8 +47,7 @@ func (l *parkingLot) release() {
 	}
 }
 
-// maxBackoffStep caps growth: flights are unbounded by the park budget and
-// would otherwise overflow the Duration range.
+// maxBackoffStep caps growth for unbounded (post-budget) flights.
 const maxBackoffStep = 2 * time.Second
 
 // backoff produces the OSEP-0024 retry schedule: exponential growth from the
@@ -93,8 +92,7 @@ func pow(base float64, exp int) float64 {
 	return result
 }
 
-// sleepBackoff waits one backoff step, cancelable through ctx; reports
-// false only when the context ended first.
+// sleepBackoff waits one backoff step; reports false only on ctx done.
 func sleepBackoff(ctx context.Context, b *backoff) bool {
 	timer := time.NewTimer(b.next())
 	defer timer.Stop()
