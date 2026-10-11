@@ -1667,7 +1667,16 @@ def responseheaders(flow: http.HTTPFlow) -> None:
 
 
 def response(flow: http.HTTPFlow) -> None:
-    """Credential proxy: release the admitted request once its response completes."""
+    """Release completed HTTP requests; upgraded transports stay admitted."""
+    if (
+        FLOW_REQUEST_HANDLE_KEY in flow.metadata
+        and flow.response is not None
+        and flow.response.status_code == 101
+    ):
+        # WebSocket and raw protocol upgrades outlive the HTTP response hook.
+        # Keep the handle so rotation assigns a retirement deadline even if
+        # the host stays bound. client_disconnected releases it with the token.
+        return
     _finish_live_request(flow)
 
 

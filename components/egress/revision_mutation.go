@@ -127,6 +127,11 @@ func (s *policyServer) mutateRevisionVault(
 	if err != nil || config == nil {
 		return detach()
 	}
+	// Rendering can expand a valid API body beyond the IPC budget. Reject it
+	// before Update sends anything; this is not an uncertain remote effect.
+	if len(payload) > config.MaxSnapshotBytes {
+		return empty, revision.ErrInvalid
+	}
 	matches := func(id revision.Identity) bool {
 		return config.ControlGeneration != "" && config.SubjectGeneration != "" &&
 			id.ControlGeneration == config.ControlGeneration && id.SubjectGeneration == config.SubjectGeneration &&

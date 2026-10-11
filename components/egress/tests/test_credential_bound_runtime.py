@@ -154,6 +154,9 @@ class EchoHandler(http.server.BaseHTTPRequestHandler):
         pass
 
     def _serve(self) -> None:
+        if self.headers.get("Upgrade"):
+            self._serve_upgrade()
+            return
         body = json.dumps(
             {
                 "host": self.headers.get("Host", ""),
@@ -166,6 +169,36 @@ class EchoHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("content-length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _serve_upgrade(self) -> None:
+        self.close_connection = True
+        # A 101 proves that the live addon supplied the admitted credential.
+        if self.headers.get("Private-Token") not in (SECRET_ONE, SECRET_TWO):
+            self.send_response(403)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        upgrade = self.headers["Upgrade"].lower()
+        self.send_response(101)
+        self.send_header("Upgrade", upgrade)
+        self.send_header("Connection", "Upgrade")
+        if upgrade == "websocket":
+            accept = hashlib.sha1(
+                (self.headers["Sec-WebSocket-Key"] + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode(),
+                usedforsecurity=False,
+            ).digest()
+            self.send_header("Sec-WebSocket-Accept", base64.b64encode(accept).decode())
+        self.end_headers()
+        # Send valid unmasked WebSocket text frames or raw protocol bytes.
+        # Bound the fixture even if a failed test leaves its socket open.
+        message = b"\x81\x04tick" if upgrade == "websocket" else b"tick"
+        try:
+            for _ in range(100):
+                self.wfile.write(message)
+                self.wfile.flush()
+                time.sleep(0.1)
+        except OSError:
+            pass
 
     do_GET = _serve
     do_POST = _serve
@@ -524,6 +557,49 @@ class CredentialBoundRuntimeTest(unittest.TestCase):
         status, payload = connection.request("GET", "/v1/second", BOUND)
         self.assertEqual(200, status)
         self.assertEqual(SECRET_TWO, payload["private_token"])
+
+    def _assert_upgrade_rotation_drains(self, protocol: str) -> None:
+        self.harness.install(1, [binding(SECRET_ONE)], [SECRET_ONE], 1)
+        connection = self.connect(sni=BOUND, trust="mitm")
+        connection.tls.sendall(
+            (
+                f"GET /v1/upgrade HTTP/1.1\r\nHost: {BOUND}\r\n"
+                f"Upgrade: {protocol}\r\nConnection: Upgrade\r\n"
+                "Sec-WebSocket-Version: 13\r\n"
+                "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+            ).encode()
+        )
+        head, body = connection._read_head(connection.tls)
+        self.assertTrue(head.startswith(b"HTTP/1.1 101"), head[:80])
+        while b"tick" not in body:
+            chunk = connection.tls.recv(4096)
+            self.assertTrue(chunk, "upgraded stream closed before rotation")
+            body += chunk
+
+        # The host remains bound, so retirement depends on the old request
+        # staying admitted after its HTTP 101 response hook.
+        started = time.monotonic()
+        self.harness.install(2, [binding(SECRET_TWO)], [SECRET_TWO], 2)
+        deadline = time.monotonic() + 3  # one-second drain plus sweep slack
+        while True:
+            remaining = deadline - time.monotonic()
+            self.assertGreater(remaining, 0, "upgraded transport missed its drain deadline")
+            connection.tls.settimeout(remaining)
+            try:
+                data = connection.tls.recv(4096)
+            except socket.timeout:
+                self.fail("upgraded transport never closed after credential rotation")
+            except (ssl.SSLEOFError, ConnectionResetError):
+                break
+            if not data:
+                break
+        self.assertGreaterEqual(time.monotonic() - started, 0.9, "upgrade drained before its deadline")
+
+    def test_websocket_rotation_closes_upgraded_transport(self) -> None:
+        self._assert_upgrade_rotation_drains("websocket")
+
+    def test_raw_upgrade_rotation_closes_upgraded_transport(self) -> None:
+        self._assert_upgrade_rotation_drains("test-protocol")
 
     def test_removal_fences_keepalive_and_returns_to_pass_through(self) -> None:
         self.harness.install(1, [binding(SECRET_ONE)], [SECRET_ONE], 1)

@@ -555,6 +555,8 @@ authenticated IPC channel and admits traffic per connection and per request:
   recovery requires replacing the whole sidecar.
 - **Request admission and cutover.** A vault mutation is applied to the live
   receiver first and published publicly only after exact confirmation.
+  A rendered snapshot exceeding the IPC size limit is rejected with HTTP 400
+  before transmission; the current vault and sidecar remain available.
   In-flight requests finish on their admitted revision; new requests on a
   connection whose host was removed are fenced immediately (403), and the
   retired transport is force-closed at the drain deadline. Deleting the vault
@@ -566,7 +568,10 @@ authenticated IPC channel and admits traffic per connection and per request:
 - **Drain accounting.** Retired transports carry a bounded retirement
   deadline (default 30 seconds, internal range 1–300). The drain sweep pages
   expired transports and closes them; a failed close is retried on the next
-  sweep rather than extending the deadline.
+  sweep rather than extending the deadline. An HTTP 101 protocol upgrade
+  (including WebSocket) retains its request admission until the connection
+  disconnects, so credential rotation also drains an upgraded transport even
+  when its host remains bound.
 - **ECH is opaque pass-through.** A ClientHello carrying the
   `encrypted_client_hello` extension (0xfe0d), including GREASE forms, is
   forwarded untouched as an opaque tunnel without decryption;

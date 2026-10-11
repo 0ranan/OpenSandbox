@@ -20,10 +20,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -742,5 +745,73 @@ func TestRevisionVaultMutationIPCChildLiveAdmission(t *testing.T) {
 		require.Equal(t, index+2, report.Counts.Commit)
 		require.Equal(t, int64(index+2), report.Active.DecisionEpoch)
 		require.False(t, s.mitmGate.MitmPending())
+	}
+}
+
+func TestRevisionVaultMutationIPCChildOversizedSnapshotKeepsSession(t *testing.T) {
+	for _, method := range []string{http.MethodPost, http.MethodPatch} {
+		t.Run(method, func(t *testing.T) {
+			t.Setenv(constants.EnvExperimentalRevisionRuntime, "true")
+			t.Setenv(constants.EnvEgressMode, constants.PolicyDnsNft)
+			s := revisionIntegrationServer(t)
+			m, child, _ := revisionIntegrationLaunchConfig(t, s, func(cfg *revisionruntime.ProcessSessionConfig) {
+				cfg.MaxSnapshotBytes = defaultRevisionMaxSnapshotSize
+				cfg.LiveAdmission = true
+				cfg.TLSCapacity, cfg.RequestCapacity, cfg.DrainTimeoutSeconds = 64, 256, 1
+			})
+			s.mitm = m
+			running, session := m.running, m.revisionSession
+			req := integrationVaultRequest("small-token")
+			template := req.Bindings[0]
+			req.Bindings = nil
+			for i := 0; i < 140; i++ {
+				binding := template
+				binding.Name = fmt.Sprintf("api-%03d", i)
+				binding.Match.Paths = []string{fmt.Sprintf("/v%d/*", i)}
+				req.Bindings = append(req.Bindings, binding)
+			}
+			smallBody, err := json.Marshal(req)
+			require.NoError(t, err)
+			if method == http.MethodPatch {
+				require.Equal(t, http.StatusCreated, liveWriteDo(t, s, http.MethodPost, string(smallBody)).Code)
+			}
+			before := child.exchange(t, map[string]string{"command": "inspect"})
+			previous, previousErr := s.credentialVault.Sanitized()
+			// A small API body can expand past the IPC limit when bindings
+			// reference the same credential. It is not an uncertain IPC write.
+			req.Credentials[0].Source, err = json.Marshal(map[string]string{"type": "inline", "value": strings.Repeat("x", 65536)})
+			require.NoError(t, err)
+			var largeBody []byte
+			if method == http.MethodPost {
+				largeBody, err = json.Marshal(req)
+			} else {
+				expected := int64(1)
+				largeBody, err = json.Marshal(credentialvault.MutationRequest{
+					ExpectedRevision: &expected,
+					Credentials:      &credentialvault.CredentialMutationSet{Replace: req.Credentials},
+				})
+			}
+			require.NoError(t, err)
+			require.Less(t, len(largeBody), 1<<20, "request must fit the public body limit")
+			response := liveWriteDo(t, s, method, string(largeBody))
+			require.Equal(t, http.StatusBadRequest, response.Code)
+			after := child.exchange(t, map[string]string{"command": "inspect"})
+			require.Equal(t, before.Counts, after.Counts, "rejection must send no IPC")
+			require.Equal(t, before.Active, after.Active)
+			current, err := s.credentialVault.Sanitized()
+			require.ErrorIs(t, err, previousErr)
+			require.Equal(t, previous, current)
+			require.Same(t, running, m.running)
+			require.Same(t, session, m.revisionSession)
+			require.Zero(t, child.stops)
+			require.False(t, s.mitmGate.MitmPending())
+			require.Equal(t, revisionRecoveryNone, s.revisionRecovery.reason)
+			// A subsequent valid mutation still uses the same child/session.
+			if method == http.MethodPost {
+				require.Equal(t, http.StatusCreated, liveWriteDo(t, s, http.MethodPost, string(smallBody)).Code)
+			} else {
+				require.Equal(t, http.StatusNoContent, liveWriteDo(t, s, http.MethodDelete, "").Code)
+			}
+		})
 	}
 }

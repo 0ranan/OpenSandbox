@@ -437,6 +437,24 @@ class CredentialBoundRequestTest(unittest.TestCase):
         self.system.response(flow_one)
         self.system.response(flow_two)
 
+    def test_protocol_upgrade_remains_admitted_until_disconnect(self) -> None:
+        flow = self._admitted_flow()
+        self.system.requestheaders(flow)
+        token = self.runtime.token_for(flow.client_conn)
+        flow.response = types.SimpleNamespace(status_code=101)
+        self.system.response(flow)
+        self.assertEqual(self.runtime.registry.request_count, 1)
+
+        # Rotation keeps the host covered. Only the retained request handle
+        # can cause this upgraded connection to retire at the old deadline.
+        with mock.patch("tls_registry.time.monotonic", return_value=100):
+            self.install_revision(2, "token-v2")
+        with mock.patch("tls_registry.time.monotonic", return_value=1000):
+            self.assertEqual(self.runtime.registry.expired_connections(), (token,))
+        self.system.client_disconnected(flow.client_conn)
+        self.assertEqual(self.runtime.registry.request_count, 0)
+        self.assertEqual(self.runtime.registry.count, 0)
+
     def test_wrong_path_gets_no_credential(self) -> None:
         flow = self._admitted_flow()
         flow.request.path = "/health"
