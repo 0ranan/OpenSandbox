@@ -22,22 +22,31 @@ import (
 	"time"
 
 	"github.com/alibaba/opensandbox/egress/pkg/credentialvault"
+	"github.com/alibaba/opensandbox/egress/pkg/log"
 	"github.com/alibaba/opensandbox/egress/pkg/policy"
 	"github.com/alibaba/opensandbox/egress/pkg/revision"
 )
 
-// mutateRevisionVault is an internal, HTTP-unwired installation transaction.
-// It does not provide transport drain acknowledgements or policy epoch updates.
+// mutateRevisionVault is the live Vault mutation transaction for the
+// experimental revision runtime. It installs a rendered candidate snapshot on
+// the receiver, reconciles an indeterminate outcome to its exact attempt, and
+// finalizes the public Store only after the exact identity is confirmed. It
+// does not provide transport drain acknowledgements or policy epoch updates;
+// connection draining is owned by the addon's decision registry deadlines.
 // prepare must only prepare a candidate from the supplied Store and policy; it
 // must not publish state or reenter policy/lifecycle methods. The caller must
-// supply a deadline context canceled when sidecar shutdown begins.
+// supply a deadline context canceled when sidecar shutdown begins. A prepare
+// failure is sanitized to the fixed public error vocabulary so client-facing
+// status codes survive without exposing arbitrary prepare error text.
 //
 // Lock order is policy barrier -> exclusive process lease. Both stay held from
 // candidate preparation through local finalization or terminal cleanup. Unlike
 // withRevisionMutationSession, this owner can detach failed resources without a
-// lock upgrade. Recovery directly stops/reaps the exact child before closing its
-// session and discarding the candidate. It never calls lifecycle lock methods.
-// IPC is context-bounded, but existing stop/reap has no hard recovery deadline.
+// lock upgrade. A terminal detach first latches sticky recovery (its remote
+// effects are unprovable), then stops/reaps the exact child before closing its
+// session and discarding the candidate; the same sidecar never restarts from
+// prior state. It never calls lifecycle lock methods. IPC is context-bounded,
+// but existing stop/reap has no hard recovery deadline.
 func (s *policyServer) mutateRevisionVault(
 	ctx context.Context, m *mitmTransparent,
 	prepare func(*credentialvault.Store, *policy.NetworkPolicy) (*credentialvault.MutationCandidate, error),
@@ -69,10 +78,13 @@ func (s *policyServer) mutateRevisionVault(
 		return empty, revision.ErrTransportUnavailable
 	}
 	candidate, err := prepare(s.credentialVault, s.effectivePolicy())
-	if err != nil || candidate == nil {
+	if err != nil {
 		if candidate != nil {
 			candidate.Discard()
 		}
+		return empty, sanitizePrepareError(err)
+	}
+	if candidate == nil {
 		return empty, revision.ErrInvalid
 	}
 	defer candidate.Discard()
@@ -89,21 +101,34 @@ func (s *policyServer) mutateRevisionVault(
 	session := m.revisionSession
 	detach := func() (credentialvault.State, error) {
 		s.mitmGate.SetReady(false)
+		// A terminal detach cannot prove the remote outcome, so it latches
+		// sticky recovery BEFORE detaching/stopping: no same-sidecar restart,
+		// every outstanding bootstrap ticket is fenced, nft is quiesced and
+		// quarantine contains. Known prepare rejection and an exact-previous
+		// reconcile are the only nonsticky outcomes and never reach here.
+		s.requireRevisionRecoveryLocked(revisionRecoveryExternalEffectsUnknown)
 		running := m.running
 		m.running, m.revisionSession = nil, nil
-		// Keep currentGen: the exact child's exit event drives fresh bootstrap, whose
-		// snapshot must wait for s.mu. Concurrent shutdown also waits for this lease.
+		// Keep currentGen: the exact child's exit event is fenced by the same
+		// recovery latch, which any fresh bootstrap must wait on via s.mu.
+		// Concurrent shutdown also waits for this lease.
 		m.revisionOwner.stop(running)
 		// Close failures remain a failed transaction. Do not expose error text that
 		// may contain credentials or filesystem details, or restore readiness here.
-		if err := session.Close(); err != nil && s.revisionRecovery != nil {
-			s.requireRevisionRecoveryLocked(revisionRecoverySessionCleanupFailed)
+		// The detach latch already quiesced/contained; preserve its first reason.
+		if err := session.Close(); err != nil {
+			log.Warnf("revision vault mutation: session cleanup failed after detach")
 		}
 		return empty, revision.ErrTransportUnavailable
 	}
 	config, err := session.MitmproxyConfig()
 	if err != nil || config == nil {
 		return detach()
+	}
+	// Rendering can expand a valid API body beyond the IPC budget. Reject it
+	// before Update sends anything; this is not an uncertain remote effect.
+	if len(payload) > config.MaxSnapshotBytes {
+		return empty, revision.ErrInvalid
 	}
 	matches := func(id revision.Identity) bool {
 		return config.ControlGeneration != "" && config.SubjectGeneration != "" &&
@@ -154,4 +179,25 @@ func (s *policyServer) mutateRevisionVault(
 		return detach()
 	}
 	return state, nil
+}
+
+// errRevisionExpectedRevision carries the optimistic-concurrency conflict in
+// the fixed public vocabulary; the numeric detail never crosses this boundary.
+var errRevisionExpectedRevision = errors.New("expectedRevision does not match the current revision")
+
+// sanitizePrepareError maps a prepare failure onto the fixed public error
+// vocabulary. Arbitrary prepare error text never crosses this boundary, so
+// a leaking prepare callback cannot disclose rendered data; only the
+// client-facing status classes (not-found, exists, revision conflict) survive.
+func sanitizePrepareError(err error) error {
+	switch {
+	case errors.Is(err, credentialvault.ErrNotFound):
+		return credentialvault.ErrNotFound
+	case errors.Is(err, credentialvault.ErrExists):
+		return credentialvault.ErrExists
+	case errors.Is(err, credentialvault.ErrRevisionConflict):
+		return errRevisionExpectedRevision
+	default:
+		return revision.ErrInvalid
+	}
 }
