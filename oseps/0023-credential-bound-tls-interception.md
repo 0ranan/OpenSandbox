@@ -620,9 +620,14 @@ uncovering `docs.example.com`.
   mutation does not revoke a credential already attached to an in-flight
   request.
 
-If the proxy cannot install the snapshot or required fence, the mutation fails
-and the previous acknowledged revision remains active. The API must not expose
-the candidate as current.
+If the proxy definitively rejects the snapshot or required fence, the mutation
+fails and the API must not expose the candidate as current. This receiver result
+alone does not prove that local Policy-file or nft effects were reversed. The
+internal sidecar's Policy integration applies those effects before receiver
+installation; after successful nft application, even a definitive rejection
+requires sticky recovery and quarantine rather than a healthy rollback. An
+unconfirmed receiver outcome likewise cannot be described as retaining the
+previous active receiver revision.
 
 ### Concurrency
 
@@ -810,6 +815,14 @@ compare `all` with the would-be credential-bound decision using counters only;
 it does not change traffic.
 
 ### Phased Implementation
+
+This section records the sequence of implementation increments. Statements about
+unwired handlers, disabled admissions or epoch-zero-only bootstrap in the earlier
+foundation descriptions are historical, not the current sidecar boundary. The
+live-Vault and Policy revision integrations below supersede those limitations;
+HTTP/2, Fast Sandbox and the public mode remain outside the current experiment.
+Acceptance evidence is tracked separately in
+[live-vault-acceptance.md](../docs/guides/live-vault-acceptance.md).
 
 The Go transaction coordinator is also an isolated in-memory foundation. It
 allocates decision epochs, checks exact acknowledgements, and blocks mutations
@@ -1093,7 +1106,8 @@ shared policy/Vault barrier and an exclusive live-generation lease. It requires
 a deadline context that its future caller must cancel on sidecar shutdown. The
 owner sends each candidate once, reconciles only the exact attempt, and checks
 the complete returned identity against the pinned generation, rendered digest,
-Vault revision and bootstrap-reserved policy epoch zero before finalization.
+Vault revision and the authoritative committed Policy epoch before finalization.
+The initial Policy epoch may be zero; later Vault writes do not reset it.
 Confirmed success finalizes even if cancellation arrives with the confirmation;
 an exact confirmed abort discards without replacing the live generation.
 
@@ -1117,13 +1131,13 @@ stop seam; this does not exercise the production mitmdump launcher,
 require Python 3 and permission to create Unix sockets; Egress CI supplies
 Python before running Go tests. Socket setup failures fail rather than skip.
 
-This owner is not wired into public HTTP handlers. Public Vault writes remain
-blocked by the experimental gate, policy mutations do not yet participate in
-revision installation, and installation confirmation is not transport drain or
-public mutation completion. Selective TLS, live admissions and request hooks
-remain disabled for the installation-only backend.
+The standalone installation-only backend confirms revision installation, not
+transport drain or public mutation completion; selective TLS, live admissions
+and request hooks remain disabled for that backend. The later live-Vault and
+Policy integrations below connect public handlers to the live receiver under
+the same owner and barrier.
 
-An internal, HTTP-unwired effective-policy candidate now freezes explicit user,
+The internal effective-policy candidate freezes explicit user,
 ordered always-deny/allow, and resolved telemetry rules without loader callbacks.
 The independent immutable policy-base handle and authoritative Store must both
 be supplied when validating a candidate under the shared mutation barrier.
@@ -1131,8 +1145,9 @@ Replacing the base handle invalidates older candidates even if policy content
 and epoch repeat; the Store's private mutation identity rejects Vault changes,
 including absent/create/delete and delete/recreate public-revision ABA.
 The experimental sidecar now tracks the live current base through a shared
-recovery/readiness owner, described below. Active policy epochs remain zero;
-policy-only candidate installation does not publish an active policy epoch.
+recovery/readiness owner, described below. The Policy integration uses this
+candidate in the actual HTTP and reload paths; successful installation advances
+the active Policy epoch only after local effects and exact receiver confirmation.
 
 The recovery/readiness owner holds the authoritative immutable effective-policy
 base, Store identity, a private non-reusable bootstrap invalidation identity and
@@ -1154,12 +1169,14 @@ their own resources for exact child stop/reap followed by session close; an old
 exit notification cannot detach a newer generation. A rejected launch permits
 a fresh capture only while recovery has not been required.
 
-Experimental policy and always-rule paths invalidate in-flight bootstrap tickets
-before attempting external effects, then replace the authoritative base on
-successful legacy publication. They use explicitly frozen loader/telemetry
-inputs and do not turn policy success responses into revision transaction ACKs.
-An uncertain failure after an attempted policy-file or nft effect, or an
-unconfirmed session cleanup, latches `recovery-required`. Pure parse/validation
+Experimental Policy and always-rule paths invalidate in-flight bootstrap tickets
+before attempting external effects. They use explicitly frozen loader/telemetry
+inputs, apply optional user-policy file persistence and nft rules, confirm the
+exact receiver revision, and only then publish the Go proxy/base and API success.
+Reload holds the live-generation lease through loader metadata and proxy/base
+publication and does not rewrite operator-owned files. An uncertain file/nft
+effect, unconfirmed session cleanup, or receiver failure after successful nft
+application latches `recovery-required`. Pure parse/validation
 failures before effects do not. Once latched, health remains not-ready, internal
 policy candidate preparation and Vault mutation ownership reject work, and
 ordinary child restart or successful IPC readback cannot clear it. Shutdown and
@@ -1256,8 +1273,9 @@ The latch is neither a network fence nor durable recovery intent. This increment
 does not provide atomic policy-file/nft rollback, restore dynamic DNS state, or
 survive a whole Go/sidecar crash. Restarting the entire sidecar loses the latch
 and is not a proven safe recovery procedure. External effects transactions,
-durable intent, active policy epochs, public mutation ACKs, selective TLS,
-request hooks, live admissions and Fast Sandbox integration remain future work.
+durable intent and Fast Sandbox integration remain future work. The later live
+Vault and Policy integrations provide process-local revision acknowledgements
+and admission, without extending these crash-recovery guarantees.
 
 The runtime-only fault-containment addition supplements that latch and Manager
 freeze with an independent packet fence for the Linux `dns+nft` sidecar. It uses the existing experimental
@@ -1266,7 +1284,8 @@ configuration. Ordinary policy, always-rule and internal Vault updates do not
 install a whole-IP fence. Containment follows the `requireRecovery` path,
 including unknown external effects. A known `prepareRejected` or
 definitive `committed=false` result does not by itself introduce permanent
-isolation. Successful updates retain their existing behavior unless recovery
+isolation when no local effect requires recovery. After a successful Policy nft
+apply, either receiver result still requires recovery and quarantine. Successful updates retain their existing behavior unless recovery
 was already required.
 
 Unexpected child death enters recovery only if the observation still belongs to
@@ -1317,19 +1336,21 @@ re-resolving credentials. An empty Vault preserves its positive revision and
 exists state; an absent Vault remains absent. Policy-only preparation changes
 neither public Vault revision nor rendered credential bytes. Canonical decision
 bytes and digest use prospective policy epoch `base + 1`, including identical
-inputs; repeated preparation does not consume epochs. No-op selection remains
-the future publication owner's responsibility. The digest authenticates the
-decision payload (Vault and epoch), not the frozen policy inputs; different
-candidates from the same base can share it. The future effect owner must bind
-external effects to the exact candidate, not infer policy identity from digest.
+inputs; repeated preparation does not consume epochs. The Policy owner preserves
+no-match DELETE and unchanged-reload no-ops, after checking recovery. Other
+committed writes, including equal content or a loader-detected rewrite, advance
+the internal epoch. The digest authenticates the decision payload (Vault and
+epoch), not the frozen Policy inputs; different candidates from the same base
+can share it. The effect owner binds external effects to the exact candidate,
+current base and Store identity rather than inferring Policy identity from digest.
 
 The candidate integration test reuses the real Go-to-Python IPC fixture to
 check prospective epoch/digest installation with admissions disabled and
 unchanged control-plane base/Vault state. It requires Unix socket permission
-and fails on setup errors. This slice supplies no disk/nft effects, live policy
-publication, rollback/crash durability, public mutation acknowledgement, or
-TLS/request/fast-sandbox activation. A later effect owner must establish those
-boundaries before wiring the candidate into public mutations.
+and fails on setup errors. This foundation test alone proves no disk/nft effects,
+live Policy publication, rollback/crash durability, public acknowledgement or
+TLS/request/Fast Sandbox activation. The integrated Policy paths require their
+own owner, IPC, runtime and image evidence.
 
 The live sidecar credential-bound loop is now wired for the Docker sidecar
 experiment (canonical HTTPS/443, exact hostnames, inline credentials, HTTP/1.1
@@ -1362,8 +1383,51 @@ readiness instead of publishing, and prepare failures cross the boundary only
 as fixed public error classes. Removed hosts fence new requests on tracked
 connections immediately and the drain timeout force-closes the transport at
 expiry, so remove/re-add cannot revive a retired connection. HTTP/2,
-fast-sandbox subjects, dynamic policy, always-rule reload, and cross-process
-recovery remain out of scope for this slice.
+fast-sandbox subjects and cross-process recovery remain out of scope.
+
+The Policy revision integration connects existing `/policy`
+`POST`/`PUT`/`PATCH`/`DELETE` handlers and automatic `deny.always` / `allow.always` reloads to that
+same barrier and exclusive live-session lease. Preflight validates the complete
+binding selector coverage before any file, nft or IPC effect. The update keeps
+Vault existence, public revision, pinned credential bytes, rendered bindings
+and redactions unchanged; it does not reread credential sources. The initial
+Policy epoch is zero, successful Policy updates advance it, and later Vault
+updates and bootstrap retain the committed epoch. The coordinator continues to
+allocate `decisionEpoch`; neither epoch becomes a public API field.
+
+The exact commit order is optional user-policy file persistence, nft application,
+receiver `Update` with exact-attempt reconciliation when needed, then Go
+proxy/base publication and API success. Reload omits user-policy persistence;
+its accepted loader view publishes after receiver confirmation. A definitive
+receiver acknowledgement wins over subsequent HTTP cancellation, so local
+publication still finishes. Missing readiness, unconfirmed outcomes and
+recovery-blocked writes return sanitized 503 errors; existing initial file/nft
+failures may remain 500. No-match DELETE and unchanged reload preserve existing
+no-op behavior but cannot bypass recovery checks. There is no new Policy
+idempotency key or digest-based content deduplication; retrying a committed write
+can advance the internal epoch and start another drain.
+
+This sequence does not make disk, kernel and receiver instantly atomic. New nft
+rules can affect traffic before receiver acknowledgement. Once nft succeeded,
+receiver rejection or an unresolved result requires sticky recovery, quarantine
+and exact-child cleanup. Restoring the file or replaying old nft rules cannot
+prove that established connections, dynamic sets or already-sent requests were
+undone. Quarantine is confirmed only by its existing target/readback checks;
+503, quiescence or child exit alone is not packet-isolation evidence. There is
+no new journal, rollback protocol or safe whole-sidecar restart mechanism.
+
+Policy-only publication registers retirement deadlines for old request handles,
+including HTTP 101 upgrades, without changing binding hosts or credentials.
+The default drain is 30 seconds and does not delay API success until expiry.
+Repeated updates do not extend the earliest old-request deadline. Still-covered
+connections can admit new-revision requests; expiry of an old request closes
+the whole connection and can interrupt those newer requests. Once old requests
+finish, a still-covered idle connection is not retired solely by a Policy epoch
+change. Actual close follows the periodic sweep and event loop, with failed
+closes retried; this does not establish a deadline for opaque/direct-IP traffic
+outside the registry. These paths remain default-off and add no supported
+public configuration, SDK method, HTTP/2 or Fast Sandbox capability. Their
+acceptance status is separate from the historical live-Vault results.
 
 1. **Decision telemetry and red tests**
    - Add fail-closed tests that distinguish authoritative empty from lookup
