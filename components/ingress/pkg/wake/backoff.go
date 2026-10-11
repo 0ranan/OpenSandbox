@@ -74,11 +74,11 @@ func (b *backoff) next() time.Duration {
 	// and the converted Duration can turn negative before any clamp.
 	b.attempt++
 	delay := float64(b.interval) * pow(b.factor, float64(b.attempt-1))
-	if max := float64(maxBackoffStep); delay > max {
-		delay = max
+	if ceiling := float64(maxBackoffStep); delay > ceiling {
+		delay = ceiling
 	}
-	if min := float64(b.interval); delay < min {
-		delay = min
+	if floor := float64(b.interval); delay < floor {
+		delay = floor
 	}
 	if b.jitter > 0 {
 		delay *= 1 + rand.Float64()*b.jitter //nolint:gosec // G404: jitter only, not security-sensitive

@@ -24,11 +24,12 @@ import (
 	"github.com/alibaba/opensandbox/ingress/pkg/wake"
 )
 
+// WakeMarkerHeader is gateway-owned: the proxy strips it from upstream
+// responses, so its presence proves the gateway never forwarded the
+// request. Post-forward answers stay bare.
+var WakeMarkerHeader = http.CanonicalHeaderKey("OpenSandbox-Wake")
+
 const (
-	// WakeMarkerHeader is gateway-owned: the proxy strips it from upstream
-	// responses, so its presence proves the gateway never forwarded the
-	// request. Post-forward answers stay bare.
-	WakeMarkerHeader   = "OpenSandbox-Wake"
 	WakeMarkerExpired  = "expired"
 	WakeTimeoutCode    = "sandbox_wake_timeout"
 	WakeTimeoutMessage = "restore still in progress; request was never forwarded and is safe to retry"
