@@ -140,6 +140,9 @@ func (p *Proxy) handle(sw *statusCapturingResponseWriter, r *http.Request) {
 		if errors.As(err, &detailed) {
 			Logger.With(slogger.Field{Key: "error", Value: detailed.InternalCause()}).Errorf("ingress: provider resolution failed")
 		}
+		if respondWakeTimeout(sw, err) {
+			return
+		}
 		if status == 0 {
 			status = http.StatusBadRequest
 		}
@@ -296,7 +299,7 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, target sandbox.End
 				r.URL.Scheme = httpScheme
 			}
 		}
-		httpProxy := NewHTTPProxy(append(extraResponseObservers, p.upstreamResponseObserver(target))...) //nolint:bodyclose // httputil.ReverseProxy owns response bodies.
+		httpProxy := NewHTTPProxy(append([]func(*http.Response){stripWakeMarkerObserver()}, append(extraResponseObservers, p.upstreamResponseObserver(target))...)...) //nolint:bodyclose // httputil.ReverseProxy owns response bodies.
 		httpProxy.errorObserver = p.upstreamErrorObserver(target)
 		httpProxy.transport = p.httpTransport
 		httpProxy.ServeHTTP(w, r)

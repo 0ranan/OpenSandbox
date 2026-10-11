@@ -62,6 +62,9 @@ var (
 	WakeParkBudget time.Duration
 	// WakeParkMax is the parking lot capacity per replica.
 	WakeParkMax int
+	// WakeRestoreMax bounds concurrent resume flights per replica; a flight
+	// holds its permit until the restore reaches a terminal outcome.
+	WakeRestoreMax int
 	// WakeRetryInterval is the first readiness-poll interval.
 	WakeRetryInterval time.Duration
 	// WakeRetryFactor grows the poll interval exponentially.

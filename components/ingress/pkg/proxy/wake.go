@@ -32,6 +32,16 @@ import (
 // 503 instead.
 const wakeReplayBodyMax = 1 << 20 // 1 MiB
 
+// wakeReplayMethods gates post-forward (stale-route) replay to idempotent
+// methods: the request bytes already reached the upstream chain, so a
+// replayed POST could execute twice. Pre-forward parking has no such gate.
+var wakeReplayMethods = map[string]bool{
+	http.MethodGet:    true,
+	http.MethodHead:   true,
+	http.MethodPut:    true,
+	http.MethodDelete: true,
+}
+
 // WithActivityRecorder installs the OSEP-0024 activity writer: every routed
 // request feeds the sandbox idle clock, fire-and-forget.
 func WithActivityRecorder(recorder activity.Recorder) Option {
@@ -102,12 +112,10 @@ func newWakeReplay(proxy *Proxy, sw *statusCapturingResponseWriter, host *sandbo
 	return c
 }
 
-// replayable reports whether the request can be replayed after a wake: the
-// body was fully buffered within the cap. Idempotent methods with bodies too
-// large to buffer are intentionally not replayed — a truncated replay would
-// corrupt the upstream call.
+// replayable reports whether a stale-route request may be replayed once:
+// idempotent method plus a body fully buffered within the cap.
 func (c *wakeReplay) replayable() bool {
-	return c.copied != nil
+	return c.copied != nil && wakeReplayMethods[c.r.Method]
 }
 
 // captureBodyForReplay buffers the request body up to the replay cap,

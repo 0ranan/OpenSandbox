@@ -44,6 +44,7 @@ var (
 const (
 	DefaultParkBudget    = 5 * time.Second
 	DefaultParkMax       = 1024
+	DefaultRestoreMax    = 256
 	DefaultRetryInterval = 50 * time.Millisecond
 	DefaultRetryFactor   = 1.3
 	DefaultRetryJitter   = 0.1
@@ -54,8 +55,12 @@ type Config struct {
 	// ParkBudget is the per-flight wait budget; late joiners share what is
 	// left of it.
 	ParkBudget time.Duration
-	// ParkMax bounds concurrently parked requests (and resume flights).
+	// ParkMax bounds concurrently parked requests per replica.
 	ParkMax int
+	// RestoreMax bounds concurrent resume flights; a flight holds its
+	// permit until terminal, so this bounds actual restores. Must not
+	// exceed ParkMax.
+	RestoreMax int
 	// RetryInterval is the first poll interval, grown by RetryFactor with
 	// up to RetryJitter relative jitter.
 	RetryInterval time.Duration
@@ -76,12 +81,28 @@ type ActivityWriter interface {
 	Record(namespace, sandboxID string)
 }
 
+// PolicySource answers the per-sandbox wake gate: only sandboxes that
+// opted in via lifecycle.idlePolicy may be woken. Must fail safe — every
+// error resolves to false.
+type PolicySource interface {
+	WakeAllowed(ctx context.Context, namespace, sandboxID string) bool
+}
+
+// AllowAll permits every sandbox; for tests and callers that gate elsewhere.
+func AllowAll() PolicySource { return allowAllPolicy{} }
+
+type allowAllPolicy struct{}
+
+func (allowAllPolicy) WakeAllowed(context.Context, string, string) bool { return true }
+
 // Waker is the per-replica wake orchestrator, safe for concurrent use.
 type Waker struct {
 	cfg       Config
 	lifecycle Lifecycle
 	activity  ActivityWriter
+	policy    PolicySource
 	lot       *parkingLot
+	permits   chan struct{}
 	flights   flightRegistry
 	epoch     atomic.Uint64
 	// processUnique keeps request_ids collision-free across replicas; the
@@ -90,9 +111,13 @@ type Waker struct {
 	now           func() time.Time
 }
 
-func NewWaker(cfg Config, lifecycle Lifecycle, activity ActivityWriter) (*Waker, error) {
+func NewWaker(cfg Config, lifecycle Lifecycle, activity ActivityWriter, policy PolicySource) (*Waker, error) {
 	if lifecycle == nil {
 		return nil, errors.New("wake: lifecycle client is required")
+	}
+	if policy == nil {
+		// No policy source means no sandbox is opted in: deny everything.
+		policy = denyAllPolicy{}
 	}
 	unique := make([]byte, 8)
 	if _, err := cryptorand.Read(unique); err != nil {
@@ -103,6 +128,12 @@ func NewWaker(cfg Config, lifecycle Lifecycle, activity ActivityWriter) (*Waker,
 	}
 	if cfg.ParkMax <= 0 {
 		cfg.ParkMax = DefaultParkMax
+	}
+	if cfg.RestoreMax <= 0 {
+		cfg.RestoreMax = DefaultRestoreMax
+	}
+	if cfg.RestoreMax > cfg.ParkMax {
+		return nil, fmt.Errorf("wake: restore permits (%d) cannot exceed the parking lot capacity (%d)", cfg.RestoreMax, cfg.ParkMax)
 	}
 	if cfg.RetryInterval <= 0 {
 		cfg.RetryInterval = DefaultRetryInterval
@@ -117,11 +148,19 @@ func NewWaker(cfg Config, lifecycle Lifecycle, activity ActivityWriter) (*Waker,
 		cfg:           cfg,
 		lifecycle:     lifecycle,
 		activity:      activity,
+		policy:        policy,
 		lot:           newParkingLot(cfg.ParkMax),
+		permits:       make(chan struct{}, cfg.RestoreMax),
+		flights:       flightRegistry{flights: make(map[flightKey]*flight)},
 		processUnique: hex.EncodeToString(unique),
 		now:           time.Now,
 	}, nil
 }
+
+// denyAllPolicy is the nil-PolicySource default.
+type denyAllPolicy struct{}
+
+func (denyAllPolicy) WakeAllowed(context.Context, string, string) bool { return false }
 
 // Wake probes the target sandbox and, when paused, parks the caller until
 // the restore converges or the budget elapses. A nil return means the
@@ -144,28 +183,24 @@ func (w *Waker) Wake(ctx context.Context, target sandbox.EndpointTarget) error {
 		return fmt.Errorf("%w: sandbox runtime is %s", sandbox.ErrSandboxNotReady, probe.RuntimeState)
 	}
 
-	// Admission precedes flight creation: the lot bounds concurrent
-	// restores, not just held connections.
+	// Opt-in gate: a paused sandbox without a wake policy keeps today's
+	// permanent 503, and no ResumeSandbox is ever issued for it. Runs
+	// before admission so denial consumes no slot and no permit.
+	if !w.policy.WakeAllowed(ctx, target.Namespace, target.SandboxID) {
+		return fmt.Errorf("%w: sandbox is paused without a wake-on-access policy", sandbox.ErrSandboxNotReady)
+	}
+
+	// Admission precedes flight creation.
 	if !w.lot.tryAcquire() {
 		telemetry.RecordParkShed()
 		return ErrParkingLotFull
 	}
 	defer w.lot.release()
 
-	flight, joined := w.flights.joinOrCreate(flightKey{namespace: target.Namespace, sandboxID: target.SandboxID}, func() *flight {
-		f := &flight{
-			key:      flightKey{namespace: target.Namespace, sandboxID: target.SandboxID},
-			target:   target,
-			epoch:    w.epoch.Add(1),
-			deadline: w.now().Add(w.cfg.ParkBudget),
-			done:     make(chan struct{}),
-			waker:    w,
-		}
-		// Background context: budget exhaustion or client disconnect must
-		// not cancel the resume.
-		go f.run(probe.CheckpointID)
-		return f
-	})
+	flight, joined, err := w.acquireFlight(ctx, target, probe.CheckpointID)
+	if err != nil {
+		return err
+	}
 	if joined {
 		telemetry.RecordWakeFlight("joined")
 	} else {
@@ -178,6 +213,57 @@ func (w *Waker) Wake(ctx context.Context, target sandbox.EndpointTarget) error {
 	telemetry.RecordParkDelta(-1)
 	telemetry.RecordParkWait(parkOutcome(waitErr), w.now().Sub(start))
 	return waitErr
+}
+
+// acquireFlight returns the sandbox's active flight, creating it under a
+// restore permit when none is running. A starter without a free permit
+// queues FIFO, bounded by its own budget; joiners take no permit.
+func (w *Waker) acquireFlight(ctx context.Context, target sandbox.EndpointTarget, checkpointID string) (*flight, bool, error) {
+	key := flightKey{namespace: target.Namespace, sandboxID: target.SandboxID}
+	if existing := w.flights.lookup(key); existing != nil {
+		return existing, true, nil
+	}
+
+	timer := time.NewTimer(w.cfg.ParkBudget)
+	defer timer.Stop()
+	select {
+	case w.permits <- struct{}{}:
+	case <-ctx.Done():
+		return nil, false, ctx.Err()
+	case <-timer.C:
+		return nil, false, ErrBudgetExhausted
+	}
+
+	// Another starter may have won while we queued; join and hand back.
+	w.flights.mu.Lock()
+	if existing := w.flights.active(key); existing != nil {
+		w.flights.mu.Unlock()
+		w.releasePermit()
+		return existing, true, nil
+	}
+	f := &flight{
+		key:      key,
+		target:   target,
+		epoch:    w.epoch.Add(1),
+		deadline: w.now().Add(w.cfg.ParkBudget),
+		done:     make(chan struct{}),
+		waker:    w,
+	}
+	w.flights.flights[key] = f
+	w.flights.mu.Unlock()
+	// Background context: budget exhaustion or client disconnect must not
+	// cancel the resume.
+	go f.run(checkpointID)
+	return f, false, nil
+}
+
+// releasePermit hands one permit back; guarded so a double release cannot
+// over-credit the pool.
+func (w *Waker) releasePermit() {
+	select {
+	case <-w.permits:
+	default:
+	}
 }
 
 func parkOutcome(waitErr error) string {

@@ -119,7 +119,10 @@ func (a *recordingActivity) snapshot() []string {
 
 func newWakeTestProxy(t *testing.T, provider sandbox.Provider, lifecycle wake.Lifecycle, act *recordingActivity, budget wake.Config) *Proxy {
 	t.Helper()
-	waker, err := wake.NewWaker(budget, lifecycle, act)
+	if budget.RestoreMax <= 0 {
+		budget.RestoreMax = budget.ParkMax
+	}
+	waker, err := wake.NewWaker(budget, lifecycle, act, wake.AllowAll())
 	require.NoError(t, err)
 	return NewProxy(
 		context.Background(),
@@ -191,7 +194,7 @@ func TestProxyWakesPausedSandboxOnResolutionFailure(t *testing.T) {
 	require.Zero(t, provider.invalids)     // resolution failures never touch the route cache
 }
 
-func TestProxyWakeBudgetExhaustionAnswersRetryAfter(t *testing.T) {
+func TestProxyWakeBudgetExhaustionAnswersMarkedRetryAfter(t *testing.T) {
 	provider := &scriptedWakeProvider{responses: []resolveAttempt{
 		{err: fmt.Errorf("%w: FastPath resolution temporarily unavailable", sandbox.ErrSandboxNotReady)},
 	}}
@@ -205,8 +208,55 @@ func TestProxyWakeBudgetExhaustionAnswersRetryAfter(t *testing.T) {
 
 	require.Equal(t, http.StatusServiceUnavailable, response.Code)
 	require.Equal(t, "1", response.Header().Get("Retry-After"))
-	// Budget exhaustion must not cancel the restore.
+	require.Equal(t, "expired", response.Header().Get("OpenSandbox-Wake"))
+	require.Contains(t, response.Header().Get("Content-Type"), "application/json")
+	body := response.Body.String()
+	require.Contains(t, body, "sandbox_wake_timeout")
+	require.Contains(t, body, "sandbox-123")
 	require.Equal(t, 1, lifecycle.resumes)
+}
+
+func TestProxyStaleRouteWakeBudgetExhaustionStaysBare(t *testing.T) {
+	// Post-forward: the wake-timeout 503 must not carry the marker.
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set(sandbox.FastSandboxProxyError, "stale_route")
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer backend.Close()
+
+	provider := &scriptedWakeProvider{responses: []resolveAttempt{{info: fsbInfo(backend.URL)}}}
+	lifecycle := &fakeLifecycle{probes: []sandbox.SandboxProbe{{Phase: sandbox.SandboxPhaseWakeable}}}
+	p := newWakeTestProxy(t, provider, lifecycle, &recordingActivity{}, wake.Config{ParkBudget: 120 * time.Millisecond, ParkMax: 8, RetryInterval: 10 * time.Millisecond})
+
+	request := httptest.NewRequest(http.MethodPut, "http://ingress/exec", strings.NewReader("hello"))
+	request.Header.Set(SandboxIngress, fsbScopeVector)
+	response := httptest.NewRecorder()
+	p.ServeHTTP(response, request)
+
+	require.Equal(t, http.StatusServiceUnavailable, response.Code)
+	require.Equal(t, "1", response.Header().Get("Retry-After"))
+	require.Empty(t, response.Header().Get("OpenSandbox-Wake"))
+	require.Equal(t, 1, lifecycle.resumes)
+}
+
+func TestProxyStripsUpstreamWakeMarker(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("OpenSandbox-Wake", "expired")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer backend.Close()
+
+	provider := &scriptedWakeProvider{responses: []resolveAttempt{{info: fsbInfo(backend.URL)}}}
+	lifecycle := &fakeLifecycle{probes: []sandbox.SandboxProbe{{Phase: sandbox.SandboxPhaseReady}}}
+	p := newWakeTestProxy(t, provider, lifecycle, &recordingActivity{}, wake.Config{ParkBudget: time.Second, ParkMax: 8, RetryInterval: time.Millisecond})
+
+	request := httptest.NewRequest(http.MethodGet, "http://ingress/", nil)
+	request.Header.Set(SandboxIngress, fsbScopeVector)
+	response := httptest.NewRecorder()
+	p.ServeHTTP(response, request)
+
+	require.Equal(t, http.StatusNoContent, response.Code)
+	require.Empty(t, response.Header().Get("OpenSandbox-Wake"))
 }
 
 func TestProxyWakeTerminalSandboxAnswersNotFound(t *testing.T) {
@@ -244,7 +294,7 @@ func TestProxyStaleRouteReplaysReplayableRequestAfterWake(t *testing.T) {
 	lifecycle := &fakeLifecycle{probes: []sandbox.SandboxProbe{{Phase: sandbox.SandboxPhaseWakeable}, {Phase: sandbox.SandboxPhaseReady}}}
 	p := newWakeTestProxy(t, provider, lifecycle, &recordingActivity{}, wake.Config{ParkBudget: 5 * time.Second, ParkMax: 8, RetryInterval: time.Millisecond})
 
-	request := httptest.NewRequest(http.MethodPost, "http://ingress/exec", strings.NewReader("hello"))
+	request := httptest.NewRequest(http.MethodPut, "http://ingress/exec", strings.NewReader("hello"))
 	request.Header.Set(SandboxIngress, fsbScopeVector)
 	response := httptest.NewRecorder()
 	p.ServeHTTP(response, request)
@@ -254,6 +304,32 @@ func TestProxyStaleRouteReplaysReplayableRequestAfterWake(t *testing.T) {
 	require.Equal(t, 2, hits.load())
 	require.Equal(t, 1, lifecycle.resumes)
 	require.Positive(t, provider.invalids) // stale route invalidated the cache
+}
+
+func TestProxyStaleRouteKeepsFiftyThreeForForwardedPost(t *testing.T) {
+	// A forwarded POST is never replayed: the stale-route 503 passes
+	// through untouched and no resume runs.
+	var hits hitCounter
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.add(1)
+		w.Header().Set(sandbox.FastSandboxProxyError, "stale_route")
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer backend.Close()
+
+	provider := &scriptedWakeProvider{responses: []resolveAttempt{{info: fsbInfo(backend.URL)}}}
+	lifecycle := &fakeLifecycle{probes: []sandbox.SandboxProbe{{Phase: sandbox.SandboxPhaseWakeable}, {Phase: sandbox.SandboxPhaseReady}}}
+	p := newWakeTestProxy(t, provider, lifecycle, &recordingActivity{}, wake.Config{ParkBudget: 5 * time.Second, ParkMax: 8, RetryInterval: time.Millisecond})
+
+	request := httptest.NewRequest(http.MethodPost, "http://ingress/exec", strings.NewReader("hello"))
+	request.Header.Set(SandboxIngress, fsbScopeVector)
+	response := httptest.NewRecorder()
+	p.ServeHTTP(response, request)
+
+	require.Equal(t, http.StatusServiceUnavailable, response.Code)
+	require.Equal(t, "1", response.Header().Get("Retry-After"))
+	require.Equal(t, 1, hits.load()) // executed exactly once upstream
+	require.Zero(t, lifecycle.resumes)
 }
 
 func TestProxyStaleRouteKeepsFiftyThreeForOversizedBody(t *testing.T) {
@@ -360,9 +436,8 @@ type failingReader struct{}
 func (failingReader) Read([]byte) (int, error) { return 0, errors.New("connection reset") }
 
 func TestProxyReplayResolutionFailureCarriesRetryAfter(t *testing.T) {
-	// The replay's fresh resolution can still hit a not-ready route right
-	// after a resume; that 503 must keep the Retry-After invitation the
-	// other 503 branches carry.
+	// The replay's fresh resolution can still hit a not-ready route; keep
+	// the Retry-After invitation.
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set(sandbox.FastSandboxProxyError, "stale_route")
 		w.WriteHeader(http.StatusServiceUnavailable)
@@ -376,7 +451,7 @@ func TestProxyReplayResolutionFailureCarriesRetryAfter(t *testing.T) {
 	lifecycle := &fakeLifecycle{probes: []sandbox.SandboxProbe{{Phase: sandbox.SandboxPhaseReady}}}
 	p := newWakeTestProxy(t, provider, lifecycle, &recordingActivity{}, wake.Config{ParkBudget: time.Second, ParkMax: 8, RetryInterval: time.Millisecond})
 
-	request := httptest.NewRequest(http.MethodPost, "http://ingress/exec", strings.NewReader("hello"))
+	request := httptest.NewRequest(http.MethodPut, "http://ingress/exec", strings.NewReader("hello"))
 	request.Header.Set(SandboxIngress, fsbScopeVector)
 	response := httptest.NewRecorder()
 	p.ServeHTTP(response, request)

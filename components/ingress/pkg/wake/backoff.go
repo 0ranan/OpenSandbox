@@ -20,10 +20,9 @@ import (
 	"time"
 )
 
-// parkingLot bounds the number of concurrently parked requests (and, because
-// admission precedes flight creation, concurrent resume flights) per replica.
-// Acquisition is non-blocking: overflow is shed immediately with 503 instead
-// of queueing.
+// parkingLot bounds concurrently parked requests. It does not bound
+// restore work: slots belong to requests and are released when a request
+// ends, while a flight outlives it — restores are bounded by permits.
 type parkingLot struct {
 	slots chan struct{}
 }
@@ -47,6 +46,10 @@ func (l *parkingLot) release() {
 	default:
 	}
 }
+
+// maxBackoffStep caps growth: flights are unbounded by the park budget and
+// would otherwise overflow the Duration range.
+const maxBackoffStep = 2 * time.Second
 
 // backoff produces the OSEP-0024 retry schedule: exponential growth from the
 // base interval by the given factor, with relative jitter applied on top
@@ -76,6 +79,9 @@ func (b *backoff) next() time.Duration {
 	if delay < b.interval {
 		delay = b.interval
 	}
+	if delay > maxBackoffStep {
+		delay = maxBackoffStep
+	}
 	return delay
 }
 
@@ -87,18 +93,14 @@ func pow(base float64, exp int) float64 {
 	return result
 }
 
-// sleepBackoff waits for one backoff step, bounded by the flight's remaining
-// budget and cancelable through ctx. The budget timer is shared across steps:
-// once it fires the flight is over. It reports false when the budget (or the
-// context) ended first.
-func sleepBackoff(ctx context.Context, budget *time.Timer, b *backoff) bool {
+// sleepBackoff waits one backoff step, cancelable through ctx; reports
+// false only when the context ended first.
+func sleepBackoff(ctx context.Context, b *backoff) bool {
 	timer := time.NewTimer(b.next())
 	defer timer.Stop()
 	select {
 	case <-timer.C:
 		return true
-	case <-budget.C:
-		return false
 	case <-ctx.Done():
 		return false
 	}

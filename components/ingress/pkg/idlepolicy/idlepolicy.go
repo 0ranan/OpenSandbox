@@ -1,0 +1,85 @@
+// Copyright 2026 The OpenSandbox Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package idlepolicy reads the per-sandbox idle policy gating OSEP-0024
+// auto-pause and wake-on-access, persisted by the server as the
+// sandbox.opensandbox.io/idle-policy annotation on the fast-sandbox Sandbox
+// CR. Parsing fails safe: anything missing, malformed, or out of range is
+// treated as no policy.
+package idlepolicy
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+)
+
+// AnnotationKey carries the JSON-encoded idle policy on the Sandbox CR.
+const AnnotationKey = "sandbox.opensandbox.io/idle-policy"
+
+// Idle action and threshold bounds.
+const (
+	OnIdlePause           = "pause"
+	MinIdleTimeoutSeconds = 30
+	MaxIdleTimeoutSeconds = 86400
+)
+
+// Policy mirrors the create-time lifecycle.idlePolicy object. ActiveProbe
+// is opaque here: the sweeper owns probe execution.
+type Policy struct {
+	IdleTimeoutSeconds *int            `json:"idleTimeoutSeconds,omitempty"`
+	OnIdle             string          `json:"onIdle,omitempty"`
+	WakeOnAccess       *bool           `json:"wakeOnAccess,omitempty"`
+	ActiveProbe        json.RawMessage `json:"activeProbe,omitempty"`
+}
+
+// Parse decodes and validates one annotation value. Unknown fields are
+// rejected so an older consumer fails safe instead of guessing.
+func Parse(raw string) (Policy, error) {
+	var policy Policy
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&policy); err != nil {
+		return Policy{}, fmt.Errorf("idlepolicy: decode %s: %w", AnnotationKey, err)
+	}
+	if policy.IdleTimeoutSeconds == nil {
+		if policy.OnIdle != "" {
+			return Policy{}, errors.New("idlepolicy: onIdle without idleTimeoutSeconds")
+		}
+	} else {
+		if policy.OnIdle == "" {
+			return Policy{}, errors.New("idlepolicy: idleTimeoutSeconds without onIdle")
+		}
+		if policy.OnIdle != OnIdlePause {
+			return Policy{}, fmt.Errorf("idlepolicy: unsupported onIdle %q", policy.OnIdle)
+		}
+		if *policy.IdleTimeoutSeconds < MinIdleTimeoutSeconds || *policy.IdleTimeoutSeconds > MaxIdleTimeoutSeconds {
+			return Policy{}, fmt.Errorf("idlepolicy: idleTimeoutSeconds %d outside [%d, %d]",
+				*policy.IdleTimeoutSeconds, MinIdleTimeoutSeconds, MaxIdleTimeoutSeconds)
+		}
+	}
+	return policy, nil
+}
+
+// WakeAllowedOf reports whether raw permits wake-on-access; every parse
+// failure resolves to false. wakeOnAccess defaults to true within a
+// declared policy.
+func WakeAllowedOf(raw string) bool {
+	policy, err := Parse(raw)
+	if err != nil {
+		return false
+	}
+	return policy.WakeOnAccess == nil || *policy.WakeOnAccess
+}

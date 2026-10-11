@@ -40,6 +40,7 @@ var (
 	parkActive            metric.Int64UpDownCounter
 	parkWaitDuration      metric.Float64Histogram
 	parkShed              metric.Int64Counter
+	restoreActive         metric.Int64UpDownCounter
 	activityWritesDropped metric.Int64Counter
 
 	connectivityProviderMu sync.RWMutex
@@ -143,6 +144,14 @@ func registerIngressMetrics() error {
 	parkShed, err = meter.Int64Counter(
 		"ingress.park.shed",
 		metric.WithDescription("Requests shed because the parking lot was full"),
+	)
+	if err != nil {
+		return err
+	}
+
+	restoreActive, err = meter.Int64UpDownCounter(
+		"ingress.wake.restore.active",
+		metric.WithDescription("Wake flights currently holding a restore permit (the concurrent-restore gauge)"),
 	)
 	if err != nil {
 		return err
@@ -354,6 +363,15 @@ func RecordParkWait(outcome string, duration time.Duration) {
 		duration.Seconds(),
 		metric.WithAttributes(attribute.String("outcome", outcome)),
 	)
+}
+
+// RecordRestoreDelta adjusts the count of flights currently holding a
+// restore permit — the concurrent-restore gauge.
+func RecordRestoreDelta(delta int64) {
+	if restoreActive == nil {
+		return
+	}
+	restoreActive.Add(context.Background(), delta)
 }
 
 // RecordParkShed counts requests shed by parking-lot admission control.
