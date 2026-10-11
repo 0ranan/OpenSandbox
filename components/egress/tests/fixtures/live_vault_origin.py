@@ -28,6 +28,7 @@ import json
 import ssl
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -94,6 +95,27 @@ class Handler(BaseHTTPRequestHandler):
 
     def _serve(self) -> None:
         record(self)
+        if self.headers.get("Upgrade") == "live-vault-test":
+            self.close_connection = True
+            # A 101 proves admission carried the expected fixture credential;
+            # the heartbeat and origin logs never contain credential values.
+            if self.headers.get("Private-Token") != "live-secret-one" * 2:
+                self.send_response(403)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            self.send_response(101)
+            self.send_header("Connection", "Upgrade")
+            self.send_header("Upgrade", "live-vault-test")
+            self.end_headers()
+            try:
+                for _ in range(3500):
+                    self.wfile.write(b"tick")
+                    self.wfile.flush()
+                    time.sleep(0.1)
+            except OSError:
+                pass
+            return
         body = json.dumps(
             {
                 "method": self.command,
@@ -118,12 +140,16 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> None:
     sans = sys.argv[1:] or ["origin.example.com"]
+    LOG_PATH.touch()
     generate_certificate(sans)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain("/run/live-origin/server.pem")
-    server = ThreadingHTTPServer(("0.0.0.0", 443), Handler)
-    server.socket = context.wrap_socket(server.socket, server_side=True)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    # :443 covers transparent interception; :4443 provides fresh non-redirected
+    # TLS sockets for actual nft Policy/always-file traffic assertions.
+    servers = [ThreadingHTTPServer(("0.0.0.0", port), Handler) for port in (443, 4443)]
+    for server in servers:
+        server.socket = context.wrap_socket(server.socket, server_side=True)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
     print(json.dumps({"ready": True, "sans": sans}), flush=True)
     threading.Event().wait()
 

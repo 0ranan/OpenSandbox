@@ -112,7 +112,7 @@ def vault_api(command: dict) -> dict:
         return {
             "vault_api": command["path"],
             "status": response.status,
-            "body": response.read().decode("utf-8", "replace")[:400],
+            "body": response.read().decode("utf-8", "replace")[:65536],
         }
     except Exception as exc:  # noqa: BLE001
         return {"vault_api": command["path"], "error": type(exc).__name__ + ": " + str(exc)[:160]}
@@ -125,10 +125,15 @@ def perform_one(request: dict, connections: list) -> dict:
         return perform_ech_hello(request)
     if request.get("raw") is not None:
         return perform_raw(request)
+    if request.get("upgrade"):
+        return perform_upgrade(request)
+    if request.get("observe_stream"):
+        return perform_stream_read(request, connections)
     if request.get("idle_read"):
         return perform_idle_read(request, connections)
     host = request["host"]
     path = request.get("path", "/echo")
+    port = request.get("port", 443)
     method = request.get("method", "GET")
     trust = request.get("trust", "none")
     host_header = request.get("host_header", host)
@@ -157,11 +162,11 @@ def perform_one(request: dict, connections: list) -> dict:
                 # hostname kept only for the Host header.
                 address = socket.gethostbyname(host)
                 connection = http.client.HTTPSConnection(
-                    address, 443, context=context, timeout=10
+                    address, port, context=context, timeout=10
                 )
             else:
                 connection = http.client.HTTPSConnection(
-                    host, 443, context=context, timeout=10
+                    host, port, context=context, timeout=10
                 )
         connection.request(method, path, headers={"Host": host_header})
         response = connection.getresponse()
@@ -170,6 +175,10 @@ def perform_one(request: dict, connections: list) -> dict:
         output["connection_close"] = "close" in response.getheader("Connection", "").lower()
         try:
             echoed = json.loads(body)
+            if "expected_private_token" in request:
+                output["private_token_matches"] = (
+                    echoed.get("private_token", "") == request["expected_private_token"]
+                )
             echoed["authorization"] = mask(echoed.get("authorization", ""))
             echoed["private_token"] = mask(echoed.get("private_token", ""))
             output["echo"] = echoed
@@ -362,6 +371,69 @@ def perform_raw(request: dict) -> dict:
         # The TLS wrap failed: the raw socket must not leak.
         with_suppressed(sock.close)
     output["_connection"] = None
+    return output
+
+
+def perform_upgrade(request: dict) -> dict:
+    """Keep a credentialed HTTP 101 transport open for a subsequent cutover."""
+    host = request["host"]
+    output = {"host": host, "upgrade": True}
+    raw = tls = None
+    try:
+        raw = socket.create_connection((host, 443), timeout=10)
+        tls = trust_context("mitm", host).wrap_socket(raw, server_hostname=host)
+        tls.sendall((
+            f"GET /v1/upgrade HTTP/1.1\r\nHost: {host}\r\n"
+            "Connection: Upgrade\r\nUpgrade: live-vault-test\r\n\r\n"
+        ).encode())
+        status, _, _ = _read_http_head(tls)
+        output["status"] = int(status)
+        if int(status) != 101:
+            raise ConnectionError("origin rejected the credentialed upgrade")
+        # Only the tiny sock/close interface is needed by read-only observers.
+        from types import SimpleNamespace
+        output["_connection"] = SimpleNamespace(sock=tls, close=tls.close)
+    except Exception as exc:  # noqa: BLE001 - fixed, credential-free evidence
+        output["error"] = type(exc).__name__ + ": " + str(exc)[:160]
+        if tls is not None or raw is not None:
+            with_suppressed((tls or raw).close)
+        output["_connection"] = None
+    return output
+
+
+def perform_stream_read(request: dict, connections: list) -> dict:
+    """Observe actual EOF/reset while consuming non-secret upgrade heartbeats."""
+    reuse = request["keepalive_with"]
+    output = {"observe_stream": True, "keepalive_with": reuse, "bytes": 0}
+    connection = connections[reuse]
+    if connection is None or connection.sock is None:
+        return {**output, "error": "no stream connection to read", "_connection": None}
+    sock = connection.sock
+    previous_timeout = sock.gettimeout()
+    started = time.monotonic()
+    deadline = started + request["duration_s"]
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                output["outcome"] = "timeout"
+                break
+            sock.settimeout(remaining)
+            data = sock.recv(65536)
+            if not data:
+                output["outcome"] = "eof"
+                break
+            output["bytes"] += len(data)
+    except TimeoutError:
+        output["outcome"] = "timeout"
+    except (ssl.SSLEOFError, ConnectionResetError):
+        output["outcome"] = "reset"
+    except OSError as exc:
+        output["error"] = type(exc).__name__ + ": " + str(exc)[:160]
+    finally:
+        with_suppressed(sock.settimeout, previous_timeout)
+    output["elapsed_s"] = round(time.monotonic() - started, 3)
+    output["_connection"] = connection
     return output
 
 
