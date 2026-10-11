@@ -159,12 +159,71 @@ func TestCRPolicySourceDoesNotCacheErrors(t *testing.T) {
 	client := newFakeDynamic()
 	client.objects["sb-1"] = annotatedSandbox(t, map[string]string{AnnotationKey: `{"idleTimeoutSeconds":300,"onIdle":"pause"}`})
 	source := NewCRPolicySource(context.Background(), client, time.Minute)
+	source.failureTTL = 0
 
 	client.getErrs["sb-1"] = errors.New("flaky")
 	require.False(t, source.WakeAllowed(context.Background(), "tenant-a", "sb-1"))
 
 	delete(client.getErrs, "sb-1")
 	require.True(t, source.WakeAllowed(context.Background(), "tenant-a", "sb-1"), "the failed read must not have been cached")
+}
+
+func TestLeaderCancelDoesNotPoisonJoiners(t *testing.T) {
+	// The shared read is detached from the leader's context: the leader
+	// disconnecting mid-GET must not fail the joiners waiting on it.
+	client := newFakeDynamic()
+	client.objects["sb-1"] = annotatedSandbox(t, map[string]string{AnnotationKey: `{"idleTimeoutSeconds":300,"onIdle":"pause"}`})
+	client.delay = 100 * time.Millisecond
+	source := NewCRPolicySource(context.Background(), client, time.Minute)
+
+	leaderCtx, cancel := context.WithCancel(context.Background())
+	leaderErr := make(chan error, 1)
+	go func() {
+		if !source.WakeAllowed(leaderCtx, "tenant-a", "sb-1") {
+			leaderErr <- errors.New("leader denied")
+		} else {
+			leaderErr <- nil
+		}
+	}()
+	time.Sleep(10 * time.Millisecond) // the leader has registered the inflight read
+	go func() {
+		time.Sleep(40 * time.Millisecond)
+		cancel() // leader disconnects mid-GET
+	}()
+
+	joinerErr := make(chan error, 2)
+	for range 2 {
+		go func() {
+			if source.WakeAllowed(context.Background(), "tenant-a", "sb-1") {
+				joinerErr <- nil
+			} else {
+				joinerErr <- errors.New("joiner denied")
+			}
+		}()
+	}
+	require.NoError(t, <-leaderErr)
+	require.NoError(t, <-joinerErr)
+	require.NoError(t, <-joinerErr)
+	require.Equal(t, 1, client.gets["sb-1"])
+}
+
+func TestFailureBackoffLimitsRetries(t *testing.T) {
+	client := newFakeDynamic()
+	client.objects["sb-1"] = annotatedSandbox(t, map[string]string{AnnotationKey: `{"idleTimeoutSeconds":300,"onIdle":"pause"}`})
+	client.getErrs["sb-1"] = errors.New("api server offline")
+	source := NewCRPolicySource(context.Background(), client, time.Minute)
+
+	base := time.Now()
+	clock := base
+	source.now = func() time.Time { return clock }
+
+	require.False(t, source.WakeAllowed(context.Background(), "tenant-a", "sb-1"))
+	require.False(t, source.WakeAllowed(context.Background(), "tenant-a", "sb-1"))
+	require.Equal(t, 1, client.gets["sb-1"], "the failure backoff must rate-limit retries")
+
+	clock = base.Add(failureBackoff + time.Second)
+	require.False(t, source.WakeAllowed(context.Background(), "tenant-a", "sb-1"))
+	require.Equal(t, 2, client.gets["sb-1"], "after the backoff window a retry is allowed")
 }
 
 func TestCRPolicySourceCollapsesColdCacheReads(t *testing.T) {

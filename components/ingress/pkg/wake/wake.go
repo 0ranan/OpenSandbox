@@ -235,36 +235,47 @@ func (w *Waker) acquireFlight(ctx context.Context, target sandbox.EndpointTarget
 
 	timer := time.NewTimer(w.cfg.ParkBudget)
 	defer timer.Stop()
-	select {
-	case w.permits <- struct{}{}:
-	case <-ctx.Done():
-		return nil, false, ctx.Err()
-	case <-timer.C:
-		return nil, false, ErrBudgetExhausted
-	}
+	// Re-check the registry while queued: with permits saturated (the very
+	// case they exist for), a joinable flight may appear at any moment and
+	// joining it beats queueing for a spare permit.
+	recheck := time.NewTicker(w.cfg.RetryInterval)
+	defer recheck.Stop()
 
-	// Another starter may have won while we queued; join and hand back.
-	w.flights.mu.Lock()
-	if existing := w.flights.active(key); existing != nil {
-		w.flights.mu.Unlock()
-		w.releasePermit()
-		return existing, true, nil
+	for {
+		select {
+		case w.permits <- struct{}{}:
+			// Another starter may have won while we queued; join and hand back.
+			w.flights.mu.Lock()
+			if existing := w.flights.active(key); existing != nil {
+				w.flights.mu.Unlock()
+				w.releasePermit()
+				return existing, true, nil
+			}
+			f := &flight{
+				key:      key,
+				target:   target,
+				epoch:    w.epoch.Add(1),
+				deadline: w.now().Add(w.cfg.ParkBudget),
+				done:     make(chan struct{}),
+				waker:    w,
+			}
+			w.flights.flights[key] = f
+			w.flights.mu.Unlock()
+			telemetry.RecordRestoreDelta(1)
+			// Background context: budget exhaustion or client disconnect must
+			// not cancel the resume.
+			go f.run(checkpointID)
+			return f, false, nil
+		case <-ctx.Done():
+			return nil, false, ctx.Err()
+		case <-timer.C:
+			return nil, false, ErrBudgetExhausted
+		case <-recheck.C:
+			if existing := w.flights.lookup(key); existing != nil {
+				return existing, true, nil
+			}
+		}
 	}
-	f := &flight{
-		key:      key,
-		target:   target,
-		epoch:    w.epoch.Add(1),
-		deadline: w.now().Add(w.cfg.ParkBudget),
-		done:     make(chan struct{}),
-		waker:    w,
-	}
-	w.flights.flights[key] = f
-	w.flights.mu.Unlock()
-	telemetry.RecordRestoreDelta(1)
-	// Background context: budget exhaustion or client disconnect must not
-	// cancel the resume.
-	go f.run(checkpointID)
-	return f, false, nil
 }
 
 // releasePermit hands one permit back; a double release cannot over-credit.

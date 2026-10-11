@@ -548,6 +548,41 @@ func TestBackoffNeverOverflowsOrRegresses(t *testing.T) {
 	}
 }
 
+func TestAcquireFlightJoinsWhileQueuedOnPermit(t *testing.T) {
+	lifecycle := &scriptedLifecycle{probes: []probeCall{pausedProbe("ckpt-1")}}
+	waker, _ := newTestWaker(t, Config{ParkBudget: 5 * time.Second, ParkMax: 8, RestoreMax: 1, RetryInterval: time.Millisecond}, lifecycle)
+
+	// Saturate the permit pool directly: a starter for a sandbox with no
+	// flight yet must queue on it.
+	waker.permits <- struct{}{}
+
+	acquired := make(chan struct{})
+	var joined *flight
+	var joinErr error
+	go func() {
+		defer close(acquired)
+		joined, _, joinErr = waker.acquireFlight(context.Background(), wakeTarget, "ckpt-1")
+	}()
+	time.Sleep(20 * time.Millisecond) // the starter is now queued on the permit
+
+	// A flight for the same sandbox appears while it waits.
+	live := &flight{
+		key:      flightKey{namespace: wakeTarget.Namespace, sandboxID: wakeTarget.SandboxID},
+		deadline: time.Now().Add(5 * time.Second),
+		done:     make(chan struct{}),
+	}
+	close(live.done)
+	waker.flights.mu.Lock()
+	waker.flights.flights[live.key] = live
+	waker.flights.mu.Unlock()
+
+	<-acquired
+	require.NoError(t, joinErr)
+	require.Same(t, live, joined)
+	// Joined without consuming a permit: the pool is untouched.
+	require.Equal(t, 1, len(waker.permits))
+}
+
 func TestRestoreGaugeIsPairedPerFlight(t *testing.T) {
 	lifecycle := &scriptedLifecycle{
 		probes:     []probeCall{pausedProbe("ckpt-1"), readyProbe()},

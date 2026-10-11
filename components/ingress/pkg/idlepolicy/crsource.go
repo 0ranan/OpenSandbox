@@ -23,6 +23,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"knative.dev/pkg/injection"
+
+	"github.com/alibaba/opensandbox/ingress/pkg/telemetry"
 )
 
 // SandboxGVR is the fast-sandbox Sandbox CR the annotation lives on.
@@ -30,6 +32,10 @@ var SandboxGVR = schema.GroupVersionResource{Group: "sandbox.fast.io", Version: 
 
 // DefaultCacheTTL bounds one CR read.
 const DefaultCacheTTL = 30 * time.Second
+
+// failureBackoff rate-limits retries after a failed read: an outage or RBAC
+// misconfiguration must not turn into one GET per request.
+const failureBackoff = 2 * time.Second
 
 // PolicySource answers the wake gate for one sandbox; must fail safe.
 type PolicySource interface {
@@ -44,9 +50,11 @@ type CRPolicySource struct {
 	ttl    time.Duration
 	now    func() time.Time
 
-	mu       sync.Mutex
-	cache    map[cacheKey]cacheEntry
-	inflight map[cacheKey]*inflightRead
+	mu         sync.Mutex
+	cache      map[cacheKey]cacheEntry
+	failures   map[cacheKey]time.Time
+	inflight   map[cacheKey]*inflightRead
+	failureTTL time.Duration
 }
 
 type cacheKey struct {
@@ -63,6 +71,7 @@ type cacheEntry struct {
 type inflightRead struct {
 	done    chan struct{}
 	allowed bool
+	ok      bool
 }
 
 // fetchTimeout bounds one API read; a hung apiserver must not hang the wake
@@ -74,12 +83,14 @@ func NewCRPolicySource(ctx context.Context, client dynamic.Interface, ttl time.D
 		ttl = DefaultCacheTTL
 	}
 	s := &CRPolicySource{
-		client:   client,
-		gvr:      SandboxGVR,
-		ttl:      ttl,
-		now:      time.Now,
-		cache:    make(map[cacheKey]cacheEntry),
-		inflight: make(map[cacheKey]*inflightRead),
+		client:     client,
+		gvr:        SandboxGVR,
+		ttl:        ttl,
+		now:        time.Now,
+		cache:      make(map[cacheKey]cacheEntry),
+		failures:   make(map[cacheKey]time.Time),
+		inflight:   make(map[cacheKey]*inflightRead),
+		failureTTL: failureBackoff,
 	}
 	go s.runCacheJanitor(ctx)
 	return s
@@ -100,21 +111,34 @@ func NewInClusterCRPolicySource(ctx context.Context) (*CRPolicySource, error) {
 // WakeAllowed reports whether the sandbox's policy permits wake-on-access;
 // every failure resolves to false.
 func (s *CRPolicySource) WakeAllowed(ctx context.Context, namespace, sandboxID string) bool {
+	allowed, outcome := s.decide(ctx, namespace, sandboxID)
+	telemetry.RecordPolicyRead(outcome)
+	return allowed
+}
+
+func (s *CRPolicySource) decide(ctx context.Context, namespace, sandboxID string) (bool, string) {
 	key := cacheKey{namespace: namespace, sandboxID: sandboxID}
 	s.mu.Lock()
-	entry, ok := s.cache[key]
-	if ok && s.now().Sub(entry.at) < s.ttl {
+	if entry, ok := s.cache[key]; ok && s.now().Sub(entry.at) < s.ttl {
 		s.mu.Unlock()
-		return entry.allowed
+		return entry.allowed, policyOutcome(entry.allowed)
+	}
+	// Failure backoff: rate-limit retries without a sticky denial.
+	if at, ok := s.failures[key]; ok && s.now().Sub(at) < s.failureTTL {
+		s.mu.Unlock()
+		return false, "error"
 	}
 	// Collapse the cold-cache stampede: one read per key, joiners wait.
 	if call, ok := s.inflight[key]; ok {
 		s.mu.Unlock()
 		select {
 		case <-call.done:
-			return call.allowed
+			if !call.ok {
+				return false, "error"
+			}
+			return call.allowed, policyOutcome(call.allowed)
 		case <-ctx.Done():
-			return false
+			return false, "error"
 		}
 	}
 	call := &inflightRead{done: make(chan struct{})}
@@ -123,25 +147,37 @@ func (s *CRPolicySource) WakeAllowed(ctx context.Context, namespace, sandboxID s
 
 	allowed, ok := s.fetch(ctx, namespace, sandboxID)
 
-	// Cache successes only: a transient API error must not become a sticky
-	// denial for the TTL.
-	if ok {
-		s.mu.Lock()
-		s.cache[key] = cacheEntry{allowed: allowed, at: s.now()}
-		s.mu.Unlock()
-	}
+	// Cache successes only; failures get a short backoff window instead of
+	// a sticky denial for the full TTL.
 	s.mu.Lock()
+	if ok {
+		s.cache[key] = cacheEntry{allowed: allowed, at: s.now()}
+	} else {
+		s.failures[key] = s.now()
+	}
 	delete(s.inflight, key)
 	s.mu.Unlock()
-	call.allowed = allowed
+	call.allowed, call.ok = allowed, ok
 	close(call.done)
-	return allowed
+	if !ok {
+		return false, "error"
+	}
+	return allowed, policyOutcome(allowed)
+}
+
+func policyOutcome(allowed bool) string {
+	if allowed {
+		return "allowed"
+	}
+	return "denied"
 }
 
 func (s *CRPolicySource) fetch(ctx context.Context, namespace, sandboxID string) (allowed, ok bool) {
+	// Detach from the leader's request context: the leader disconnecting
+	// must not abort the read its joiners are waiting on.
 	// resourceVersion "0" = accepted-stale; the gate tolerates staleness by
 	// design.
-	ctx, cancel := context.WithTimeout(ctx, fetchTimeout)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), fetchTimeout)
 	defer cancel()
 	cr, err := s.client.Resource(s.gvr).Namespace(namespace).Get(ctx, sandboxID, metav1.GetOptions{ResourceVersion: "0"})
 	if err != nil {
@@ -159,10 +195,16 @@ func (s *CRPolicySource) runCacheJanitor(ctx context.Context) {
 			return
 		case <-ticker.C:
 			cutoff := s.now().Add(-s.ttl)
+			failCutoff := s.now().Add(-s.failureTTL)
 			s.mu.Lock()
 			for key, entry := range s.cache {
 				if entry.at.Before(cutoff) {
 					delete(s.cache, key)
+				}
+			}
+			for key, at := range s.failures {
+				if at.Before(failCutoff) {
+					delete(s.failures, key)
 				}
 			}
 			s.mu.Unlock()
