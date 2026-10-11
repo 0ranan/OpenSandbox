@@ -499,6 +499,7 @@ Ingress (meter `ingress`):
 | `opensandbox.ingress.park.shed` | counter | — | lot full; sustained growth ⇒ capacity or restore-latency problem |
 | `opensandbox.ingress.wake.restore.active` | up-down counter | — | flights currently holding a restore permit; the concurrent-restore gauge |
 | `opensandbox.ingress.activity.writes_dropped` | counter | — | Redis pressure indicator |
+| `opensandbox.ingress.idlep.policy.reads` | counter | `outcome` = `allowed`/`denied`/`error` | wake-gate decisions; sustained `error` ⇒ RBAC or apiserver problem, `denied` ⇒ sandboxes not opted in |
 
 Server (meter `server`):
 
