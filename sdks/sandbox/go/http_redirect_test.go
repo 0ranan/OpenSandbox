@@ -50,7 +50,7 @@ func TestRedirectProtectedHeadersOrigin(t *testing.T) {
 				"OPENSANDBOX-EGRESS-AUTH":   {"egress"},
 				"X-Custom":                  {"keep"},
 			}
-			require.NoError(t, protectedHeaderRedirectPolicy(nil)(target, []*http.Request{initial}))
+			require.NoError(t, protectedHeaderRedirectPolicy(nil, "OPEN-SANDBOX-API-KEY")(target, []*http.Request{initial}))
 			require.Equal(t, "keep", target.Header.Get("X-Custom"))
 			if tc.same {
 				require.Equal(t, 4, len(target.Header))
@@ -74,11 +74,12 @@ func TestRedirectCustomPolicyAndClientIsolation(t *testing.T) {
 				CheckRedirect: func(req *http.Request, via []*http.Request) error {
 					calls++
 					req.Header["oPeNsAnDbOx-Secure-Access"] = []string{"re-added"}
+					req.Header["x-CuStOm-AuTh"] = []string{"re-added-token"}
 					return policyErr
 				},
 			}
 			client := NewClient("http://example.com", "key", "OPEN-SANDBOX-API-KEY",
-				WithHTTPClient(original), WithTimeout(time.Second))
+				WithHTTPClient(original), WithTimeout(time.Second), WithAuthHeader("X-Custom-Auth"))
 			require.True(t, client.httpClient != original)
 			require.Equal(t, time.Minute, original.Timeout)
 			require.True(t, client.httpClient.Transport == transport)
@@ -96,7 +97,7 @@ func TestRedirectCustomPolicyAndClientIsolation(t *testing.T) {
 			// The caller's policy remains untouched.
 			target.Header = make(http.Header)
 			_ = original.CheckRedirect(target, []*http.Request{initial})
-			require.Equal(t, 1, len(target.Header))
+			require.Equal(t, 2, len(target.Header))
 		})
 	}
 }
@@ -157,7 +158,7 @@ func TestRedirectCustomPolicyStopsRequests(t *testing.T) {
 }
 
 func TestRedirectRequestPaths(t *testing.T) {
-	for _, path := range []string{"lifecycle", "execd", "egress", "download", "upload", "SSE"} {
+	for _, path := range []string{"lifecycle", "execd", "proxy-execd", "egress", "download", "upload", "SSE"} {
 		for _, sameOrigin := range []bool{true, false} {
 			name := path + "/cross-origin"
 			if sameOrigin {
@@ -206,30 +207,45 @@ func TestRedirectRequestPaths(t *testing.T) {
 				})}
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
+				authHeader := execdAuthHeader
 				switch path {
 				case "lifecycle":
+					authHeader = "X-API-Key"
+					opts = append(opts, WithAuthHeader(authHeader))
 					client := NewLifecycleClient(source.URL, "tenant", opts...)
 					err := client.doRequest(ctx, http.MethodGet, "/start", nil, nil)
 					require.NoError(t, err)
 				case "execd":
-					require.NoError(t, NewExecdClient(source.URL, "", opts...).Ping(ctx))
+					require.NoError(t, NewExecdClient(source.URL, "execd-token", opts...).Ping(ctx))
+				case "proxy-execd":
+					// ConnectionConfig applies the lifecycle auth override even to
+					// execd, whose endpoint headers still use its intrinsic token name.
+					cfg := ConnectionConfig{AuthHeader: "X-API-Key", Headers: map[string]string{
+						"X-API-Key": "tenant", "X-Custom": "keep",
+					}}
+					client := cfg.execdClient(source.URL, map[string]string{
+						execdAuthHeader: "endpoint-token", "OPEN-SANDBOX-API-KEY": "tenant",
+						"OpenSandbox-Secure-Access": "endpoint", "OPENSANDBOX-EGRESS-AUTH": "egress",
+					})
+					require.NoError(t, client.Ping(ctx))
 				case "egress":
+					authHeader = egressAuthHeader
 					_, err := NewEgressClient(source.URL, "egress", opts...).GetPolicy(ctx)
 					require.NoError(t, err)
 				case "download":
-					reader, err := NewExecdClient(source.URL, "", opts...).DownloadFile(ctx, "/file", "")
+					reader, err := NewExecdClient(source.URL, "execd-token", opts...).DownloadFile(ctx, "/file", "")
 					require.NoError(t, err)
 					content, err := io.ReadAll(reader)
 					require.NoError(t, err)
 					require.NoError(t, reader.Close())
 					require.Equal(t, "file content", string(content))
 				case "upload":
-					err := NewExecdClient(source.URL, "", opts...).UploadFile(ctx, strings.NewReader("upload"),
+					err := NewExecdClient(source.URL, "execd-token", opts...).UploadFile(ctx, strings.NewReader("upload"),
 						UploadFileOptions{FileName: "file", Metadata: FileMetadata{Path: "/file"}})
 					require.NoError(t, err)
 				case "SSE":
 					events := 0
-					err := NewExecdClient(source.URL, "", opts...).WatchMetrics(ctx, func(event StreamEvent) error {
+					err := NewExecdClient(source.URL, "execd-token", opts...).WatchMetrics(ctx, func(event StreamEvent) error {
 						events++
 						return nil
 					})
@@ -240,11 +256,18 @@ func TestRedirectRequestPaths(t *testing.T) {
 				for i := 0; i < 2; i++ {
 					headers := <-observed
 					require.Equal(t, "keep", headers.Get("X-Custom"))
-					for _, name := range []string{"OPEN-SANDBOX-API-KEY", "OpenSandbox-Secure-Access", "OPENSANDBOX-EGRESS-AUTH"} {
+					for _, name := range []string{"OPEN-SANDBOX-API-KEY", "OpenSandbox-Secure-Access", "OPENSANDBOX-EGRESS-AUTH", authHeader} {
 						if sameOrigin {
 							require.NotEmpty(t, headers.Get(name))
 						} else {
 							require.Equal(t, "", headers.Get(name))
+						}
+					}
+					if path == "proxy-execd" {
+						if sameOrigin {
+							require.Equal(t, "tenant", headers.Get("X-API-Key"))
+						} else {
+							require.Equal(t, "", headers.Get("X-API-Key"))
 						}
 					}
 				}

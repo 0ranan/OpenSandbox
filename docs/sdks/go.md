@@ -792,13 +792,15 @@ SDK-created HTTP clients enforce NIST 2030 minimum TLS certificate strength by d
 
 The Go SDK retains Go's standard redirect behavior, including for file uploads
 and downloads. On redirects to a different origin (scheme, hostname, or effective
-port), it removes all headers whose names start with `OPEN-SANDBOX-` or
-`OPENSANDBOX-`, case-insensitively. Each redirect destination is compared with
+port), it removes the client's default and configured authentication headers (including
+`X-EXECD-ACCESS-TOKEN`, `X-API-Key`, or a custom `WithAuthHeader` name), as well
+as all headers whose names start with `OPEN-SANDBOX-` or `OPENSANDBOX-`,
+case-insensitively. Each redirect destination is compared with
 the initial request's origin, so subsequent hops on another origin remain
 protected. Same-origin redirects retain these headers. Unrelated custom headers
 continue to follow Go's standard forwarding rules.
 
-This protection applies to lifecycle, execd, egress, file transfers, and SSE
+This protection applies to lifecycle (including creation metrics), execd, egress, file transfers, and SSE
 requests. A custom `http.Client.CheckRedirect` supplied through `WithHTTPClient`
 or `ConnectionConfig.HTTPClient` still controls whether redirects are followed;
 the SDK removes protected headers after that callback runs, even if the callback

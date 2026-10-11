@@ -218,7 +218,7 @@ func NewClient(baseURL, apiKey, authHeader string, opts ...Option) *Client {
 	if c.httpClient.Transport == nil {
 		c.httpClient.Transport = DefaultTransport()
 	}
-	c.httpClient.CheckRedirect = protectedHeaderRedirectPolicy(c.httpClient.CheckRedirect)
+	c.httpClient.CheckRedirect = protectedHeaderRedirectPolicy(c.httpClient.CheckRedirect, authHeader, c.authHeader)
 	// Apply deferred timeout after all options so it works regardless of
 	// WithHTTPClient ordering and guards against a nil httpClient.
 	if c.timeout != nil {
@@ -246,7 +246,13 @@ func redirectOrigin(u *url.URL) [3]string {
 	return [3]string{scheme, strings.ToLower(u.Hostname()), port}
 }
 
-func protectedHeaderRedirectPolicy(policy func(*http.Request, []*http.Request) error) func(*http.Request, []*http.Request) error {
+func protectedHeaderRedirectPolicy(policy func(*http.Request, []*http.Request) error, authHeaders ...string) func(*http.Request, []*http.Request) error {
+	protectedAuthHeaders := make(map[string]bool, len(authHeaders))
+	for _, name := range authHeaders {
+		if name != "" {
+			protectedAuthHeaders[strings.ToUpper(name)] = true
+		}
+	}
 	return func(req *http.Request, via []*http.Request) error {
 		// Save the initial origin before a caller callback can change requests.
 		origin := redirectOrigin(via[0].URL)
@@ -263,7 +269,7 @@ func protectedHeaderRedirectPolicy(policy func(*http.Request, []*http.Request) e
 			// each destination, including later hops on the foreign origin.
 			for name := range req.Header {
 				upper := strings.ToUpper(name)
-				if strings.HasPrefix(upper, "OPEN-SANDBOX-") || strings.HasPrefix(upper, "OPENSANDBOX-") {
+				if protectedAuthHeaders[upper] || strings.HasPrefix(upper, "OPEN-SANDBOX-") || strings.HasPrefix(upper, "OPENSANDBOX-") {
 					delete(req.Header, name)
 				}
 			}
