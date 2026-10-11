@@ -205,13 +205,13 @@ func newWakeOption(ctx context.Context, fsbProvider *sandbox.FastSandboxProvider
 		log.Panicf("Wake-on-access requires Kubernetes API access to read sandbox idle policies: %v", err)
 	}
 	waker, err := wake.NewWaker(wake.Config{
-		ParkBudget:    flag.WakeParkBudget,
-		ParkMax:       flag.WakeParkMax,
-		RestoreMax:         flag.WakeRestoreMax,
-		MaxFlightLifetime:  flag.WakeMaxFlightLifetime,
-		RetryInterval:      flag.WakeRetryInterval,
-		RetryFactor:   flag.WakeRetryFactor,
-		RetryJitter:   flag.WakeRetryJitter,
+		ParkBudget:        flag.WakeParkBudget,
+		ParkMax:           flag.WakeParkMax,
+		RestoreMax:        flag.WakeRestoreMax,
+		MaxFlightLifetime: flag.WakeMaxFlightLifetime,
+		RetryInterval:     flag.WakeRetryInterval,
+		RetryFactor:       flag.WakeRetryFactor,
+		RetryJitter:       flag.WakeRetryJitter,
 	}, fsbProvider, activityWriter, policySource)
 	if err != nil {
 		log.Panicf("Failed to create waker: %v", err)
