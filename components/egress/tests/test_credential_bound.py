@@ -24,12 +24,15 @@ drain expiry, and fail-closed boundaries.
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import importlib.util
 import json
 import sys
 import types
 import unittest
+import weakref
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -690,6 +693,200 @@ class _FakeAdmission:
 
 def _fake_admission(snapshot: Any) -> _FakeAdmission:
     return _FakeAdmission(snapshot)
+
+
+class CredentialBoundSnapshotMemoTest(unittest.TestCase):
+    """Pure synthetic snapshots and fake hooks; no receiver or IPC startup."""
+
+    def setUp(self) -> None:
+        sys.path.insert(0, str(MITMSCRIPTS))
+        self.system = _load_system_module()
+        self.conn = _ClientConn(sni="api.example.com")
+        self.runtime = mock.Mock()
+        self.runtime.token_for.return_value = types.SimpleNamespace(sni=self.conn.sni)
+        self.system._live_runtime = self.runtime
+
+    def tearDown(self) -> None:
+        self.system.done()
+        sys.path.remove(str(MITMSCRIPTS))
+        sys.modules.pop("revision_receiver", None)
+
+    def _snapshot(self, revision: int = 1, *, empty: bool = False) -> Any:
+        from revision_receiver import Snapshot
+
+        value = f"fake-token-{revision}"
+        payload = _decision_payload(
+            [] if empty else [_binding("api", "api.example.com", value)],
+            [] if empty else [value], revision,
+        )
+        return Snapshot(_revision(payload, revision, revision), payload)
+
+    def _request(self, snapshot: Any) -> _Flow:
+        self.runtime.acquire_request.return_value = _fake_admission(snapshot)
+        flow = _Flow(client_conn=self.conn)
+        self.system.requestheaders(flow)
+        return flow
+
+    def test_equal_revision_decodes_and_parses_once(self) -> None:
+        snapshot = self._snapshot()
+        with mock.patch.object(
+            self.system.json, "loads", wraps=json.loads
+        ) as decode, mock.patch.object(
+            self.system, "_parse_active_vault", wraps=self.system._parse_active_vault
+        ) as parse:
+            first = self.system._live_snapshot_vault(snapshot)
+            equivalent = replace(snapshot, revision=replace(snapshot.revision))
+            self.assertIs(first, self.system._live_snapshot_vault(equivalent))
+        self.assertEqual(decode.call_count, 1)
+        self.assertEqual(parse.call_count, 1)
+
+    def test_full_revision_identity_is_the_cache_key(self) -> None:
+        snapshot = self._snapshot()
+        variants = [
+            replace(snapshot, revision=replace(snapshot.revision, **change))
+            for change in (
+                {"control_generation": "control-live-b"},
+                {"subject_generation": "subject-live-b"},
+                {"decision_epoch": 2},
+                {"policy_epoch": 1},
+            )
+        ]
+        # Different serialization has a different verified digest even though
+        # its rendered bindings and numeric Vault revision have not changed.
+        payload = snapshot.payload + b" "
+        variants.append(replace(
+            snapshot, payload=payload,
+            revision=replace(snapshot.revision, digest=hashlib.sha256(payload).hexdigest()),
+        ))
+        variants.append(self._snapshot(2))
+        for changed in variants:
+            with self.subTest(revision=changed.revision):
+                old = self.system._live_snapshot_vault(snapshot)
+                current = self.system._live_snapshot_vault(changed)
+                self.assertIsNot(old, current)
+                self.assertEqual(self.system._live_vault_cache, (changed.revision, current))
+
+        # Even a corrupt envelope differing only in vault_revision must miss
+        # and fail validation, rather than return the cached valid view.
+        self.system._live_snapshot_vault(snapshot)
+        corrupt = replace(snapshot, revision=replace(snapshot.revision, vault_revision=2))
+        with self.assertRaises(self.system.ActiveVaultLookupError):
+            self.system._live_snapshot_vault(corrupt)
+        self.assertIsNone(self.system._live_vault_cache)
+
+    def test_active_empty_is_a_cached_success(self) -> None:
+        self.system._live_snapshot_vault(self._snapshot())
+        snapshot = self._snapshot(2, empty=True)
+        with mock.patch.object(self.system.json, "loads", wraps=json.loads) as decode:
+            for _ in range(2):
+                flow = self._request(snapshot)
+                self.assertIsNone(flow.response)
+                self.assertNotIn("Authorization", flow.request.headers)
+        self.assertEqual(decode.call_count, 1)
+        self.assertEqual(self.system._live_vault_cache, (snapshot.revision, None))
+
+    def test_invalid_snapshot_is_not_cached_or_replaced_with_old_view(self) -> None:
+        good = self._snapshot()
+        invalid_schema = json.loads(self._snapshot(2).payload)
+        invalid_schema["fullRenderedBindings"][0]["headers"][0]["value"] = 123
+        for payload in (b"not-json-fake-token", json.dumps(invalid_schema).encode()):
+            with self.subTest(payload=payload):
+                self.system._live_snapshot_vault(good)
+                invalid = replace(good, payload=payload, revision=_revision(payload, 2, 2))
+                with mock.patch.object(self.system.json, "loads", wraps=json.loads) as decode:
+                    for _ in range(2):
+                        flow = self._request(invalid)
+                        self.assertEqual(flow.response.status_code, 503)
+                        self.assertEqual(flow.response.body, b"credential proxy unavailable\n")
+                        self.assertNotIn("Authorization", flow.request.headers)
+                        self.assertNotIn(self.system.FLOW_REQUEST_HANDLE_KEY, flow.metadata)
+                        self.assertIsNone(self.system._live_vault_cache)
+                self.assertEqual(decode.call_count, 2)
+        self.assertEqual(self.runtime.finish_request.call_count, 4)
+        self.assertNotIn("not-json-fake-token", " ".join(self.system.ctx.log.messages))
+
+    def test_cached_view_still_requires_admission_and_authority(self) -> None:
+        snapshot = self._snapshot()
+        with mock.patch.object(
+            self.system, "_live_snapshot_vault", wraps=self.system._live_snapshot_vault
+        ) as lookup:
+            self._request(snapshot)
+            self._request(snapshot)
+            self.runtime.acquire_request.return_value = types.SimpleNamespace(
+                action="deny", reason="connection_fenced",
+            )
+            denied = _Flow(client_conn=self.conn)
+            self.system.requestheaders(denied)
+            self.runtime.acquire_request.return_value = _fake_admission(snapshot)
+            wrong_host = _Flow(client_conn=self.conn, host="other.example.com")
+            self.system.requestheaders(wrong_host)
+            self.assertEqual(lookup.call_count, 2)
+        self.assertEqual(self.runtime.acquire_request.call_count, 4)
+        for flow in (denied, wrong_host):
+            self.assertEqual(flow.response.status_code, 403)
+            self.assertNotIn("Authorization", flow.request.headers)
+
+    def test_same_connection_uses_new_admission_snapshot(self) -> None:
+        first = self._snapshot()
+        self.runtime.token_for.return_value.revision = first.revision
+        self.assertEqual(self._request(first).request.headers.get("Authorization"), "fake-token-1")
+        self.assertEqual(self._request(self._snapshot(2)).request.headers.get("Authorization"), "fake-token-2")
+
+    def test_many_revisions_retain_only_one_parsed_view(self) -> None:
+        references = []
+        for revision in range(1, 21):
+            snapshot = self._snapshot(revision)
+            vault = self.system._live_snapshot_vault(snapshot)
+            references.append(weakref.ref(vault))
+            self.assertEqual(self.system._live_vault_cache, (snapshot.revision, vault))
+        del vault
+        gc.collect()
+        self.assertTrue(all(reference() is None for reference in references[:-1]))
+        self.assertIsNotNone(references[-1]())
+
+    def test_done_releases_memo_even_when_close_fails(self) -> None:
+        for close_fails in (False, True):
+            with self.subTest(close_fails=close_fails):
+                snapshot = self._snapshot()
+                reference = weakref.ref(self.system._live_snapshot_vault(snapshot))
+                def close() -> None:
+                    self.assertIsNone(self.system._live_vault_cache)
+                    if close_fails:
+                        raise RuntimeError("fake close failure")
+                self.runtime.close.side_effect = close
+                self.system._live_runtime = self.runtime
+                self.system.done()
+                gc.collect()
+                self.assertIsNone(reference())
+                # The same module can parse again after its owner teardown;
+                # test isolation uses done(), not the transport-only reset.
+                with mock.patch.object(self.system.json, "loads", wraps=json.loads) as decode:
+                    self.system._live_snapshot_vault(snapshot)
+                self.assertEqual(decode.call_count, 1)
+
+    def test_eviction_and_done_preserve_existing_flow_material(self) -> None:
+        payload = json.loads(self._snapshot().payload)
+        binding = payload["fullRenderedBindings"][0]
+        binding["headers"] = []
+        binding["substitutions"] = [
+            {"placeholder": "FAKE_PLACEHOLDER", "value": "fake-token-1", "in": ["body"]}
+        ]
+        payload["redactions"].append("FAKE_PLACEHOLDER")
+        encoded = json.dumps(payload).encode()
+        snapshot = replace(self._snapshot(), payload=encoded, revision=_revision(encoded, 1, 1))
+        flow = self._request(snapshot)
+        saved_binding = flow.metadata[self.system.FLOW_BINDING_KEY]
+        saved_redactions = list(flow.metadata[self.system.FLOW_VAULT_REDACTIONS_KEY])
+        self.system._live_snapshot_vault(self._snapshot(2))
+        self.system.done()
+        self.assertIs(flow.metadata[self.system.FLOW_BINDING_KEY], saved_binding)
+        self.assertEqual(flow.metadata[self.system.FLOW_VAULT_REDACTIONS_KEY], saved_redactions)
+        flow.request.content = b"FAKE_PLACEHOLDER"
+        self.system.request(flow)
+        self.assertEqual(flow.request.content, b"fake-token-1")
+        flow.response = _Response.make(200, headers={"x-echo": "fake-token-1"})
+        self.system.responseheaders(flow)
+        self.assertEqual(flow.response.headers.get("x-echo"), "[REDACTED]")
 
 
 class CredentialBoundEnvTest(unittest.TestCase):

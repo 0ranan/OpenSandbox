@@ -67,11 +67,14 @@ import os
 import re
 import socket
 from contextlib import suppress
-from typing import Any, NoReturn
+from typing import TYPE_CHECKING, Any, NoReturn
 from urllib.parse import quote, quote_plus, unquote
 
 from mitmproxy import ctx, http
 from mitmproxy.tls import ClientHelloData
+
+if TYPE_CHECKING:
+    from revision_receiver import Revision
 
 CREDENTIAL_PROXY_SOCKET_ENV = "OPENSANDBOX_CREDENTIAL_PROXY_SOCKET"
 DEFAULT_CREDENTIAL_PROXY_SOCKET = "/run/opensandbox/credential-proxy/active.sock"
@@ -147,6 +150,10 @@ _vault_cache: ActiveVault | None = None
 _revision_receiver: Any | None = None
 _revision_server: Any | None = None
 _live_runtime: Any | None = None
+# Read-only binding views keyed by the complete, already-verified Revision.
+# Keep only one entry, until the next cache miss or done(); this does not promise
+# immediate wiping of retired credentials or mutate views held by older flows.
+_live_vault_cache: tuple[Revision, ActiveVault | None] | None = None
 
 # Operator-only diagnostics; no public interception mode is enabled here.
 _tls_shadow_enabled = os.environ.get(
@@ -299,12 +306,13 @@ def configure(updated: set) -> None:
 
 def done() -> None:
     """Fence the receiver and remove only its owned socket during addon exit."""
-    global _revision_receiver, _revision_server, _live_runtime
+    global _revision_receiver, _revision_server, _live_runtime, _live_vault_cache
     server = _revision_server
     runtime = _live_runtime
     _revision_receiver = None
     _revision_server = None
     _live_runtime = None
+    _live_vault_cache = None
     if runtime is not None:
         try:
             runtime.close()
@@ -1518,7 +1526,18 @@ def _live_snapshot_vault(snapshot: Any) -> ActiveVault | None:
     (no credential can match). Raises ActiveVaultLookupError for any payload
     that does not exactly reconstruct the validated envelope, which fails the
     request closed instead of forwarding it uncredentialed by accident.
+
+    Only call after successful request admission and authority checks. The
+    receiver has already verified the immutable payload's digest; memoizing
+    its parsed view never caches the admission or rehashes the payload.
     """
+    global _live_vault_cache
+    identity = snapshot.revision
+    cached = _live_vault_cache
+    if cached is not None and cached[0] == identity:
+        return cached[1]
+    # A miss drops the owner's old view even if decoding or validation fails.
+    _live_vault_cache = None
     try:
         payload = json.loads(snapshot.payload)
     except Exception:  # noqa: BLE001 - payload bytes may contain credentials
@@ -1533,15 +1552,18 @@ def _live_snapshot_vault(snapshot: Any) -> ActiveVault | None:
     if state == "active-empty":
         if bindings:
             raise ActiveVaultLookupError("admitted snapshot state disagreement")
+        _live_vault_cache = (identity, None)
         return None
     if state != "active" or not isinstance(bindings, list) or not bindings:
         raise ActiveVaultLookupError("admitted snapshot has no rendered bindings")
     redactions = payload.get("redactions", [])
     if not isinstance(redactions, list):
         raise ActiveVaultLookupError("admitted snapshot redactions are invalid")
-    return _parse_active_vault(
+    vault = _parse_active_vault(
         {"revision": revision, "bindings": bindings, "redactions": redactions}
     )
+    _live_vault_cache = (identity, vault)
+    return vault
 
 
 def _apply_vault_binding(
