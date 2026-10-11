@@ -32,9 +32,10 @@ rules:
   {{- if .Values.gateway.wake.enabled }}
   # OSEP-0024 wake gating: read-only access to the fast-sandbox Sandbox CR
   # so the gateway can check the per-sandbox idle policy before waking it.
+  # Reads are watch-cache LISTs (rv=0, metadata.name selector) — never etcd.
   - apiGroups: ["sandbox.fast.io"]
     resources: ["sandboxes"]
-    verbs: ["get"]
+    verbs: ["list"]
   {{- end }}
 ---
 apiVersion: {{ include "opensandbox-ingress-gateway.rbac.apiVersion" . }}

@@ -108,11 +108,20 @@ func (s *CRPolicySource) WakeAllowed(ctx context.Context, namespace, sandboxID s
 }
 
 func (s *CRPolicySource) fetch(ctx context.Context, namespace, sandboxID string) bool {
-	cr, err := s.client.Resource(s.gvr).Namespace(namespace).Get(ctx, sandboxID, metav1.GetOptions{})
-	if err != nil {
+	// LIST scoped by metadata.name with ResourceVersion "0": this is served
+	// from the apiserver's watch cache and never falls through to etcd
+	// (single-object GET cannot give that guarantee). CRDs support the
+	// metadata.name field selector by default. An empty result — object
+	// gone, or cache lag — degrades to "no policy": a delayed wake, never a
+	// wrong one.
+	list, err := s.client.Resource(s.gvr).Namespace(namespace).List(ctx, metav1.ListOptions{
+		ResourceVersion: "0",
+		FieldSelector:   "metadata.name=" + sandboxID,
+	})
+	if err != nil || len(list.Items) == 0 {
 		return false
 	}
-	return WakeAllowedOf(cr.GetAnnotations()[AnnotationKey])
+	return WakeAllowedOf(list.Items[0].GetAnnotations()[AnnotationKey])
 }
 
 // runCacheJanitor drops expired entries.
