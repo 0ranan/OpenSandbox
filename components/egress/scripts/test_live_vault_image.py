@@ -71,7 +71,12 @@ REQUIRED = [
     "TestRotationStaleAndKeepalive",
     "TestDeleteRevocationAndRemoveReadd",
     "TestIdleDrainClose",
+    "TestPolicyRevisionAPIMutations",
+    "TestPolicyRevisionRejectsBoundDeny",
+    "TestPolicyOnlyDrain",
+    "TestPolicyThenVaultMutation",
     "TestFailureBoundaries",
+    "TestAlwaysReloadRevision",
 ]
 
 
@@ -170,9 +175,11 @@ class LiveVaultRuntime:
         self.badcert = self.network + "-badcert"
         self.workdir = Path(tempfile.mkdtemp(prefix="osbs-live-vault-"))
         self.subnet = ""
+        self.rulesdir = self.workdir / "rules"
         # Only resources this invocation actually created may be cleaned up.
         self.created: set[str] = set()
         self.cleanup_report: list[dict] = []
+        self.evidence_errors: list[str] = []
 
     @property
     def cleanup_failures(self) -> list[str]:
@@ -188,6 +195,16 @@ class LiveVaultRuntime:
         prefix = self.subnet.rsplit(".", 1)[0]
         return f"{prefix}.{ORIGIN_IP_SUFFIX}", f"{prefix}.{BADCERT_IP_SUFFIX}"
 
+    def policy(self, *, badcert_allowed: bool = True) -> dict:
+        origin_ip, badcert_ip = self.origin_addresses()
+        return {
+            "defaultAction": "deny",
+            "egress": [{"action": "allow", "target": target} for target in (
+                BOUND, UNBOUND, BADCERT, origin_ip,
+                *((badcert_ip,) if badcert_allowed else ()),
+            )],
+        }
+
     def __enter__(self):
         try:
             if not self._create_network():
@@ -195,6 +212,7 @@ class LiveVaultRuntime:
             origin_ip, badcert_ip = self.origin_addresses()
             shared = self.workdir / "shared"
             shared.mkdir()
+            self.rulesdir.mkdir()
             (shared / "badcert").mkdir()
             self.docker.run(
                 "run", "-d", "--name", self.origin, "--network", self.network,
@@ -223,24 +241,19 @@ class LiveVaultRuntime:
                 "OPENSANDBOX_EGRESS_EXPERIMENTAL_REVISION_RUNTIME": "true",
                 "OPENSANDBOX_EGRESS_MODE": "dns+nft",
                 "OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT": "true",
-                "OPENSANDBOX_EGRESS_RULES": json.dumps({
-                    "defaultAction": "deny",
-                    "egress": [
-                        {"action": "allow", "target": BOUND},
-                        {"action": "allow", "target": UNBOUND},
-                        {"action": "allow", "target": BADCERT},
-                        {"action": "allow", "target": origin_ip},
-                        {"action": "allow", "target": badcert_ip},
-                    ],
-                }),
+                "OPENSANDBOX_EGRESS_RULES": json.dumps(self.policy()),
                 "OPENSANDBOX_EGRESS_TOKEN": TOKEN,
                 "OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_EXTRA_CA": "/run/live-origin/ca.pem",
-                "OPENSANDBOX_EGRESS_REVISION_DRAIN_TIMEOUT_SECONDS": str(self.drain_seconds),
             }
+            # With 30 seconds, exercise the production default rather than
+            # overriding it with an equivalent test-only setting.
+            if self.drain_seconds != 30:
+                env["OPENSANDBOX_EGRESS_REVISION_DRAIN_TIMEOUT_SECONDS"] = str(self.drain_seconds)
             args = ["run", "-d", "--name", self.egress, "--network", self.network,
                     "--label", f"opensandbox.live-vault-test={self.run_id}",
                     "--cap-add", "NET_ADMIN", "--security-opt", "no-new-privileges",
                     "-v", f"{shared}:/run/live-origin:ro",
+                    "-v", f"{self.rulesdir}:/var/egress/rules",
                     "--add-host", f"{BOUND}:{origin_ip}",
                     "--add-host", f"{UNBOUND}:{origin_ip}",
                     "--add-host", f"{BADCERT}:{badcert_ip}"]
@@ -339,7 +352,8 @@ class LiveVaultRuntime:
         return out
 
     def egress_logs(self) -> str:
-        return self.docker.run("logs", self.egress, timeout=60).stdout
+        result = self.docker.run("logs", self.egress, timeout=60)
+        return result.stdout + result.stderr
 
     def __exit__(self, *_exc):
         """Remove only resources this invocation created; record every outcome.
@@ -350,6 +364,23 @@ class LiveVaultRuntime:
         gone. Nothing created before this run is ever deleted.
         """
         self.cleanup_report = []
+        # Capture evidence before resources disappear, on failures as well as
+        # success. Failure to read logs cannot prevent owned-resource cleanup.
+        for name, label in ((self.egress, "egress"), (self.origin, "origin"), (self.badcert, "badcert")):
+            if name not in self.created:
+                continue
+            try:
+                logs = self.docker.run("logs", name, check=False)
+                (self.docker.artifacts / (label + "-logs.txt")).write_text(sanitize(logs.stdout + logs.stderr))
+                if logs.returncode:
+                    self.evidence_errors.append(label + ": logs rc=" + str(logs.returncode))
+                if name != self.egress:
+                    requests = self.exec_origin(name, "cat", "/tmp/origin-log.jsonl", check=False)
+                    (self.docker.artifacts / (label + "-requests.jsonl")).write_text(sanitize(requests.stdout))
+                    if requests.returncode:
+                        self.evidence_errors.append(label + ": requests rc=" + str(requests.returncode))
+            except Exception as exc:  # noqa: BLE001 - evidence failure is explicit
+                self.evidence_errors.append(label + ": " + type(exc).__name__)
         for name in (self.egress, self.origin, self.badcert):
             if name not in self.created:
                 self._cleanup_unregistered("container", name, "rm", "-f", name)
@@ -557,12 +588,180 @@ def _version_evidence(docker: Docker) -> dict:
     }
 
 
+def api(method: str, path: str, body=None) -> dict:
+    command = {"method": method, "path": path, "token": TOKEN}
+    if body is not None:
+        command["body"] = body if isinstance(body, str) else json.dumps(body)
+    return {"vault_api": command}
+
+
+def public_state(runtime: LiveVaultRuntime) -> tuple[dict, dict]:
+    policy, vault = runtime.client({"requests": [api("GET", "/policy"), api("GET", "/credential-vault")]})
+    require(policy.get("status") == 200 and vault.get("status") == 200,
+            f"cannot read accepted public state: {policy}, {vault}")
+    return json.loads(policy["body"]), json.loads(vault["body"])
+
+
+def bound_request(path: str, **extra) -> dict:
+    return {"host": BOUND, "path": path, "trust": "mitm",
+            "expected_private_token": SECRET_ONE, **extra}
+
+
+def assert_bound(outcome: dict) -> None:
+    require(outcome.get("status") == 200 and outcome.get("private_token_matches") is True,
+            f"bound request did not retain exact credential bytes: {outcome}")
+
+
+def probe_badcert(runtime: LiveVaultRuntime, path: str, allowed: bool) -> None:
+    before = len(runtime.origin_log(runtime.badcert))
+    # A fresh direct TLS socket on 4443 proves the actual nft permit/deny.
+    # Using the proxy's :443 path here could reuse an established upstream
+    # transport, which static policy updates intentionally do not revoke.
+    result = runtime.client({"requests": [{"host": BADCERT, "port": 4443,
+                                           "path": path, "trust": "none"}]})[0]
+    if allowed:
+        require(result.get("status") == 200 and not result["echo"].get("private_token"),
+                f"allowed unbound origin traffic did not arrive: {result}")
+    else:
+        require("error" in result and len(runtime.origin_log(runtime.badcert)) == before,
+                f"denied traffic reached the origin: {result}")
+    require(runtime.health() == "200", "policy test made the runtime unhealthy")
+
+
+def policy_api_mutations(runtime: LiveVaultRuntime):
+    created = runtime.client({"requests": [api("POST", "/credential-vault", vault_body(SECRET_ONE))]})[0]
+    require(created.get("status") == 201, f"policy test vault setup failed: {created}")
+    _, original_vault = public_state(runtime)
+    badcert_ip = runtime.origin_addresses()[1]
+    mutations = [
+        ("POST", runtime.policy(badcert_allowed=False), False),
+        ("PUT", runtime.policy(), True),
+        ("PATCH", [{"action": "deny", "target": badcert_ip}], False),
+        ("DELETE", [badcert_ip], False),
+    ]
+    # Every mutation is bracketed by requests on the same actual socket;
+    # no in-flight old request remains, so an idle covered connection lives.
+    requests = [bound_request("/v1/policy-before")]
+    for index, (method, body, _) in enumerate(mutations):
+        requests += [api(method, "/policy", body),
+                     bound_request(f"/v1/policy-after-{index}", keepalive_with=0)]
+    outcomes = runtime.client({"requests": requests})
+    assert_bound(outcomes[0])
+    for index, (method, _, _) in enumerate(mutations):
+        changed, after = outcomes[index * 2 + 1:index * 2 + 3]
+        require(changed.get("status") == 200, f"{method} policy mutation failed: {changed}")
+        require(after.get("reused_connection") is True, f"{method} replaced the keepalive socket: {after}")
+        assert_bound(after)
+    # Independently exercise each committed rule's traffic effect rather
+    # than inferring revision publication solely from equal credentials.
+    for method, body, allowed in mutations:
+        changed = runtime.client({"requests": [api(method, "/policy", body)]})[0]
+        require(changed.get("status") == 200, f"{method} traffic setup failed: {changed}")
+        probe_badcert(runtime, f"/v1/policy-{method.lower()}", allowed)
+        _, vault = public_state(runtime)
+        require(vault == original_vault, f"{method} changed the public Vault view")
+    restored = runtime.client({"requests": [api("PUT", "/policy", runtime.policy())]})[0]
+    require(restored.get("status") == 200, f"policy restoration failed: {restored}")
+
+
+def policy_rejects_bound_deny(runtime: LiveVaultRuntime):
+    before = public_state(runtime)
+    for method, body in (("PATCH", [{"action": "deny", "target": BOUND}]),
+                         ("DELETE", [BOUND]), ("POST", "")):
+        rejected, bound = runtime.client({"requests": [api(method, "/policy", body),
+                                                       bound_request("/v1/after-rejected-policy")]})
+        require(rejected.get("status") == 400, f"incompatible {method} was not rejected: {rejected}")
+        require(public_state(runtime) == before, "rejected policy changed accepted public state")
+        require(runtime.health() == "200", "preflight rejection damaged runtime health")
+        assert_bound(bound)
+
+
+def policy_only_drain(runtime: LiveVaultRuntime):
+    _, before = public_state(runtime)
+    upgraded, changed, early, terminal, reconnected = runtime.client({"requests": [
+        {"host": BOUND, "upgrade": True},
+        api("PATCH", "/policy", [{"action": "allow", "target": "policy-drain.example.com"}]),
+        {"observe_stream": True, "keepalive_with": 0, "duration_s": 0.25},
+        {"observe_stream": True, "keepalive_with": 0, "duration_s": runtime.drain_seconds + 4},
+        bound_request("/v1/policy-reconnected"),
+    ]})
+    require(upgraded.get("status") == 101, f"credentialed 101 was not admitted: {upgraded}")
+    require(changed.get("status") == 200, f"policy-only cutover failed: {changed}")
+    require(early.get("outcome") == "timeout" and early.get("bytes", 0) > 0,
+            f"upgrade did not survive before its drain deadline: {early}")
+    require(terminal.get("outcome") in ("eof", "reset"), f"upgrade never reached socket terminal state: {terminal}")
+    elapsed = early.get("elapsed_s", 0) + terminal.get("elapsed_s", 0)
+    require(runtime.drain_seconds - 0.2 <= elapsed < runtime.drain_seconds + 4,
+            f"upgrade did not honor the {runtime.drain_seconds}s deadline: {elapsed}")
+    assert_bound(reconnected)
+    require(public_state(runtime)[1] == before, "policy-only drain changed the Vault")
+
+
+def policy_then_vault_mutation(runtime: LiveVaultRuntime):
+    _, before = public_state(runtime)
+    expected = before["revision"]
+    changed, rotated, traffic = runtime.client({"requests": [
+        api("PATCH", "/policy", [{"action": "allow", "target": "policy-vault.example.com"}]),
+        api("PATCH", "/credential-vault", rotate_body(expected, SECRET_TWO)),
+        {"host": BOUND, "path": "/v1/policy-then-vault", "trust": "mitm", "expected_private_token": SECRET_TWO},
+    ]})
+    require(changed.get("status") == 200 and rotated.get("status") == 200,
+            f"Policy to Vault epoch continuity failed: {changed}, {rotated}")
+    require(traffic.get("status") == 200 and traffic.get("private_token_matches") is True,
+            f"post-Policy rotation did not inject the new credential: {traffic}")
+    require(public_state(runtime)[1]["revision"] == expected + 1, "rotation did not advance Vault revision")
+    # Existing failure-boundary case starts with an absent Vault.
+    deleted = runtime.client({"requests": [api("DELETE", "/credential-vault")]})[0]
+    require(deleted.get("status") == 204, f"vault teardown failed: {deleted}")
+
+
+def always_reload(runtime: LiveVaultRuntime):
+    # Remove the preceding wrong-certificate binding; only BOUND remains.
+    deleted, created, policy = runtime.client({"requests": [
+        api("DELETE", "/credential-vault"), api("POST", "/credential-vault", vault_body(SECRET_ONE)),
+        api("PUT", "/policy", runtime.policy(badcert_allowed=False)),
+    ]})
+    require([deleted.get("status"), created.get("status"), policy.get("status")] == [204, 201, 200],
+            "always reload setup failed")
+    before = public_state(runtime)
+    badcert_ip = runtime.origin_addresses()[1]
+    probe_badcert(runtime, "/v1/reload-before-allow", False)
+
+    def change_and_wait(filename: str, contents: str, marker: str) -> None:
+        # This is the mounted operator-owned file and the actual existing
+        # minute job. No reload endpoint, interval override, or test hook.
+        previous = runtime.egress_logs().count(marker)
+        (runtime.rulesdir / filename).write_text(contents)
+        deadline = time.monotonic() + 85
+        while time.monotonic() < deadline:
+            if runtime.egress_logs().count(marker) > previous:
+                return
+            require(runtime.health() == "200", "always reload made the runtime unhealthy")
+            time.sleep(2)
+        raise Failure(f"real periodic reload never produced {marker!r}")
+
+    applied = "policy API: reloaded always rules applied"
+    rejected = "policy API: periodic reload of always rules failed"
+    change_and_wait("allow.always", badcert_ip + "\n", applied)
+    probe_badcert(runtime, "/v1/reload-allowed", True)
+    require(public_state(runtime) == before, "always overlay changed user Policy or Vault")
+    # A conflicting staged deny cannot publish either deny in this file.
+    change_and_wait("deny.always", BOUND + "\n" + badcert_ip + "\n", rejected)
+    probe_badcert(runtime, "/v1/reload-conflict-kept-prior", True)
+    assert_bound(runtime.client({"requests": [bound_request("/v1/reload-bound-survives")]})[0])
+    require(public_state(runtime) == before, "rejected reload changed public state")
+    change_and_wait("deny.always", badcert_ip + "\n", applied)
+    probe_badcert(runtime, "/v1/reload-denied", False)
+    assert_bound(runtime.client({"requests": [bound_request("/v1/reload-bound-still-live")]})[0])
+    require(public_state(runtime) == before, "accepted reload changed user Policy or Vault")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image", help="ordinary egress image to test")
     parser.add_argument("--artifacts", type=Path, help="directory for evidence")
-    parser.add_argument("--drain-seconds", type=int, default=2,
-                        help="credential transition drain timeout in the sidecar")
+    parser.add_argument("--drain-seconds", type=int, default=30,
+                        help="drain timeout (30 exercises the production default; shorter runs are supplemental)")
     parser.add_argument("--base",
                         help="full SHA of the chosen comparison base; "
                              "recorded verbatim, UNCONFIRMED when omitted")
@@ -592,6 +791,7 @@ def main(argv=None):
         },
         "environment": _version_evidence(docker),
         "git": _git_evidence(),
+        "drain": {"seconds": args.drain_seconds, "production_default": args.drain_seconds == 30},
     }
     # UNCONFIRMED is a valid absence of a chosen base, not evidence of one.
     evidence["git"]["base"] = args.base or "UNCONFIRMED"
@@ -838,10 +1038,11 @@ def main(argv=None):
                           "body": _add_badcert_binding(1), "token": TOKEN},
         }]})[0]
         require(added.get("status") == 200, f"badcert binding PATCH failed: {added}")
+        before_badcert = len(runtime.origin_log(runtime.badcert))
         bad = runtime.client({"requests": [{"host": BADCERT, "path": "/v1/data", "trust": "mitm"}]})[0]
         require(bad.get("status") == 502 or "error" in bad,
                 f"wrong upstream certificate was not rejected: {bad}")
-        require(not runtime.origin_log(runtime.badcert),
+        require(len(runtime.origin_log(runtime.badcert)) == before_badcert,
                 "wrong-certificate origin still received requests")
 
         no_sni = runtime.client({"requests": [
@@ -879,7 +1080,12 @@ def main(argv=None):
             run_case(REQUIRED[5], lambda: test_rotation_stale_keepalive(runtime), results, artifacts)
             run_case(REQUIRED[6], lambda: test_delete_revocation(runtime), results, artifacts)
             run_case(REQUIRED[7], lambda: test_idle_drain_close(runtime), results, artifacts)
-            run_case(REQUIRED[8], lambda: test_failure_boundaries(runtime), results, artifacts)
+            run_case(REQUIRED[8], lambda: policy_api_mutations(runtime), results, artifacts)
+            run_case(REQUIRED[9], lambda: policy_rejects_bound_deny(runtime), results, artifacts)
+            run_case(REQUIRED[10], lambda: policy_only_drain(runtime), results, artifacts)
+            run_case(REQUIRED[11], lambda: policy_then_vault_mutation(runtime), results, artifacts)
+            run_case(REQUIRED[12], lambda: test_failure_boundaries(runtime), results, artifacts)
+            run_case(REQUIRED[13], lambda: always_reload(runtime), results, artifacts)
             (artifacts / "egress-logs.txt").write_text(sanitize(runtime.egress_logs()))
             evidence["environment"]["mitmproxy"] = docker.run(
                 "exec", runtime.egress, "mitmdump", "--version", check=False
@@ -935,6 +1141,9 @@ def main(argv=None):
             print("Live vault image validation FAILED: cleanup left "
                   + ",".join(cleanup_failures), file=sys.stderr)
             success = False
+        if runtime is not None and runtime.evidence_errors:
+            results.append({"name": "EvidenceCapture", "status": "FAIL", "errors": runtime.evidence_errors})
+            success = False
         ended_utc = datetime.datetime.now(datetime.timezone.utc).isoformat()
         passed = sum(1 for r in results if r["status"] == "PASS")
         failed = sum(1 for r in results if r["status"] == "FAIL")
@@ -950,6 +1159,7 @@ def main(argv=None):
             "utc": {"start": started_utc, "end": ended_utc},
             "environment": evidence["environment"],
             "git": evidence["git"],
+            "drain": evidence["drain"],
             "cleanup": {
                 "status": "clean" if not cleanup_failures else "failed",
                 "failures": cleanup_failures,

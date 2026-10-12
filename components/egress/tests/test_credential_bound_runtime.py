@@ -71,7 +71,7 @@ def free_port() -> int:
     return port
 
 
-def decision_payload(bindings: list[dict], redactions: list[str], vault_revision: int) -> bytes:
+def decision_payload(bindings: list[dict], redactions: list[str], vault_revision: int, policy_epoch: int = 0) -> bytes:
     selectors = sorted(
         host
         for item in bindings
@@ -82,7 +82,7 @@ def decision_payload(bindings: list[dict], redactions: list[str], vault_revision
         {
             "version": 1,
             "vaultRevision": vault_revision,
-            "effectivePolicyEpoch": 0,
+            "effectivePolicyEpoch": policy_epoch,
             "interceptionMode": "credential-bound",
             "state": "active" if bindings else "active-empty",
             "tlsBindingHostSelectors": selectors,
@@ -157,6 +157,12 @@ class EchoHandler(http.server.BaseHTTPRequestHandler):
         if self.headers.get("Upgrade"):
             self._serve_upgrade()
             return
+        held = self.server.held_requests.get(self.path)
+        if held is not None:
+            entered, release = held
+            entered.set()
+            if not release.wait(60):
+                return
         body = json.dumps(
             {
                 "host": self.headers.get("Host", ""),
@@ -193,7 +199,7 @@ class EchoHandler(http.server.BaseHTTPRequestHandler):
         # Bound the fixture even if a failed test leaves its socket open.
         message = b"\x81\x04tick" if upgrade == "websocket" else b"tick"
         try:
-            for _ in range(100):
+            for _ in range(600):
                 self.wfile.write(message)
                 self.wfile.flush()
                 time.sleep(0.1)
@@ -224,6 +230,7 @@ class TLSOriginServer(socketserver.ThreadingTCPServer):
 
     def __init__(self, address, handler, context: ssl.SSLContext) -> None:
         self.tls_context = context
+        self.held_requests: dict[str, tuple[threading.Event, threading.Event]] = {}
         super().__init__(address, handler)
 
     def get_request(self):
@@ -285,6 +292,9 @@ class TunneledConnection:
         self.tls.sendall(
             f"{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: keep-alive\r\n\r\n".encode()
         )
+        return self.read_response()
+
+    def read_response(self) -> tuple[int, dict]:
         head, body = self._read_head(self.tls, self.buffer)
         self.buffer = b""
         status = int(head.split(b" ", 2)[1])
@@ -406,6 +416,8 @@ class LiveRuntimeHarness:
             except subprocess.TimeoutExpired:
                 self.process.kill()
                 self.process.wait(timeout=5)
+        for _, release in self.origin.held_requests.values():
+            release.set()
         self.origin.shutdown()
         self.origin.server_close()
         self.log.close()
@@ -443,14 +455,15 @@ class LiveRuntimeHarness:
             raise AssertionError(f"active readback failed: {status} {value}")
         return value["revision"]
 
-    def install(self, epoch: int, bindings: list[dict], redactions: list[str], revision: int) -> dict:
-        payload = decision_payload(bindings, redactions, revision)
+    def install(self, epoch: int, bindings: list[dict], redactions: list[str], revision: int,
+                *, policy_epoch: int = 0) -> dict:
+        payload = decision_payload(bindings, redactions, revision, policy_epoch)
         envelope = {
             "controlGeneration": CONTROL,
             "subjectGeneration": SUBJECT,
             "decisionEpoch": epoch,
             "vaultRevision": revision,
-            "policyEpoch": 0,
+            "policyEpoch": policy_epoch,
             "digest": hashlib.sha256(payload).hexdigest(),
         }
         status, value = self.command(
@@ -488,7 +501,7 @@ class CredentialBoundRuntimeTest(unittest.TestCase):
         # transparent-mode port-443 evidence remains image-runner only.
         self.harness = LiveRuntimeHarness(self.root, origin_port=free_port())
         self.addCleanup(self.harness.stop)
-        self.harness.start()
+        self.harness.start(getattr(self, "drain_seconds", 1))
         self.connections: list[TunneledConnection] = []
         self.addCleanup(self._close_connections)
 
@@ -634,6 +647,132 @@ class CredentialBoundRuntimeTest(unittest.TestCase):
             self.assertEqual("", payload.get("private_token", ""))
         except (ClientError, ssl.SSLError, OSError, ConnectionError):
             pass
+
+
+@unittest.skipUnless(MITMDUMP, "mitmdump is not installed")
+class PolicyOnlyRuntimeTest(unittest.TestCase):
+    """Full revision cutovers with unchanged Vault bindings and credential bytes."""
+
+    _close_connections = CredentialBoundRuntimeTest._close_connections
+    connect = CredentialBoundRuntimeTest.connect
+
+    def setUp(self) -> None:
+        # The long request and both 101 protocols share one real 30s cutover.
+        self.drain_seconds = 30 if "default_30s" in self._testMethodName else 2
+        CredentialBoundRuntimeTest.setUp(self)
+
+    def install(self, epoch: int) -> dict:
+        revision = self.harness.install(
+            epoch, [binding(SECRET_ONE)], [SECRET_ONE], 1, policy_epoch=epoch - 1,
+        )
+        self.assertEqual(revision, self.harness.active())
+        self.assertEqual(1, revision["vaultRevision"])
+        return revision
+
+    def hold_request(self, path: str) -> tuple[TunneledConnection, threading.Event]:
+        entered, release = threading.Event(), threading.Event()
+        self.harness.origin.held_requests[path] = (entered, release)
+        connection = self.connect(sni=BOUND, trust="mitm")
+        connection.tls.sendall(
+            f"GET {path} HTTP/1.1\r\nHost: {BOUND}\r\nConnection: keep-alive\r\n\r\n".encode()
+        )
+        self.assertTrue(entered.wait(5), "origin never admitted the held request")
+        return connection, release
+
+    def upgrade(self, protocol: str) -> TunneledConnection:
+        connection = self.connect(sni=BOUND, trust="mitm")
+        connection.tls.sendall((
+            f"GET /v1/upgrade HTTP/1.1\r\nHost: {BOUND}\r\n"
+            f"Upgrade: {protocol}\r\nConnection: Upgrade\r\n"
+            "Sec-WebSocket-Version: 13\r\n"
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+        ).encode())
+        head, body = connection._read_head(connection.tls)
+        self.assertTrue(head.startswith(b"HTTP/1.1 101"), head[:80])
+        while b"tick" not in body:
+            chunk = connection.tls.recv(4096)
+            self.assertTrue(chunk, "upgrade closed before the policy cutover")
+            body += chunk
+        return connection
+
+    def assert_idle(self, connection: TunneledConnection, seconds: float) -> None:
+        connection.tls.settimeout(seconds)
+        try:
+            with self.assertRaises(socket.timeout):
+                connection.tls.recv(4096)
+        finally:
+            connection.tls.settimeout(10)
+
+    def test_policy_only_cutover_preserves_idle_keepalive_and_credential(self) -> None:
+        old = self.install(1)
+        connection = self.connect(sni=BOUND, trust="mitm")
+        self.assertEqual(SECRET_ONE, connection.request("GET", "/v1/before", BOUND)[1]["private_token"])
+        socket_identity = connection.tls.getsockname()
+        new = self.install(2)
+        self.assertNotEqual(old["digest"], new["digest"])
+        # No old request remains. Passing the old deadline must not retire an
+        # idle connection that is still covered by the identical host selector.
+        self.assert_idle(connection, self.drain_seconds + 0.75)
+        status, payload = connection.request("GET", "/v1/after", BOUND)
+        self.assertEqual((200, SECRET_ONE), (status, payload["private_token"]))
+        self.assertEqual(socket_identity, connection.tls.getsockname())
+
+    def test_finished_old_request_cancels_policy_only_retirement(self) -> None:
+        self.install(1)
+        connection, release = self.hold_request("/v1/held-finish")
+        self.install(2)
+        release.set()
+        status, payload = connection.read_response()
+        self.assertEqual((200, SECRET_ONE), (status, payload["private_token"]))
+        self.assert_idle(connection, self.drain_seconds + 0.75)
+        self.assertEqual(200, connection.request("GET", "/v1/after-finish", BOUND)[0])
+
+    def test_policy_only_default_30s_long_and_101_keep_earliest_deadline(self) -> None:
+        self.install(1)
+        held, _ = self.hold_request("/v1/held-drain")
+        connections = [held, self.upgrade("websocket"), self.upgrade("test-protocol")]
+        started = time.monotonic()
+        self.install(2)
+        outcomes: list[tuple[float, str] | None] = [None] * len(connections)
+
+        def observe(index: int, connection: TunneledConnection) -> None:
+            deadline = started + 34
+            try:
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        outcomes[index] = (time.monotonic() - started, "timeout")
+                        return
+                    connection.tls.settimeout(remaining)
+                    if not connection.tls.recv(4096):
+                        outcomes[index] = (time.monotonic() - started, "eof")
+                        return
+            except TimeoutError:
+                outcomes[index] = (time.monotonic() - started, "timeout")
+            except (ssl.SSLEOFError, ConnectionResetError):
+                outcomes[index] = (time.monotonic() - started, "reset")
+
+        readers = [threading.Thread(target=observe, args=(index, connection), daemon=True)
+                   for index, connection in enumerate(connections)]
+        for reader in readers:
+            reader.start()
+        # Another policy-only revision halfway through cannot extend any old
+        # request's first retirement deadline. No credential or binding changes.
+        time.sleep(15)
+        self.assertEqual([None] * len(connections), outcomes, "policy cutover closed a transport early")
+        self.install(3)
+        for reader in readers:
+            reader.join(timeout=max(0.1, started + 35 - time.monotonic()))
+            self.assertFalse(reader.is_alive(), "transport observer did not finish")
+        for protocol, outcome in zip(("long response", "websocket", "raw 101"), outcomes):
+            self.assertIsNotNone(outcome, protocol)
+            elapsed, terminal = outcome
+            self.assertIn(terminal, ("eof", "reset"), protocol)
+            self.assertGreaterEqual(elapsed, 29.8, protocol + " drained before 30s")
+            self.assertLess(elapsed, 34, protocol + " extended the first deadline")
+        fresh = self.connect(sni=BOUND, trust="mitm")
+        status, payload = fresh.request("GET", "/v1/reconnected", BOUND)
+        self.assertEqual((200, SECRET_ONE), (status, payload["private_token"]))
 
 
 @unittest.skipUnless(MITMDUMP, "mitmdump is not installed")

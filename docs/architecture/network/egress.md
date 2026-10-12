@@ -27,7 +27,7 @@ Egress is how a sandbox gets a network policy instead of open internet access. I
 
 **Layer 2 — Network (`dns+nft` mode).** nftables drops everything not explicitly allowed. Allowed traffic passes by static rule or by DNS-learned address sets: a resolved IP receives a bounded lease (with a grace window for active TCP connections), so "allowed" never silently becomes "allowed forever". UDP and QUIC flows rely on DNS lease timing alone.
 
-**Precedence.** First matching rule wins, in this order: platform `deny.always`, platform `allow.always`, then your policy — so the platform's deny always beats your allow. The overlays live in files inside the sidecar image and hot-reload every minute. A reload publishes the parsed pair only after the corresponding nftables static policy is accepted; parse or apply failures keep the active in-memory rules. Failures remain eligible for retry unless the experimental revision runtime requires recovery, as described below. Your policy is set per sandbox and can be mutated at runtime (add, replace, remove by target) through the API the SDKs expose.
+**Precedence.** First matching rule wins, in this order: platform `deny.always`, platform `allow.always`, then your policy — so the platform's deny always beats your allow. The overlays live in files inside the sidecar image and hot-reload every minute. A reload publishes the parsed pair only after the corresponding nftables static policy is accepted; the experimental revision runtime additionally requires exact receiver confirmation. Parse or apply failures keep the last accepted in-memory rules. Failures remain eligible for retry unless the experimental revision runtime requires recovery, as described below. Your policy is set per sandbox and can be mutated at runtime (add, replace, remove by target) through the API the SDKs expose.
 
 ## Design decisions
 
@@ -47,29 +47,56 @@ Layers 1 and 2 decide *whether* a connection may happen; the transparent MITM la
 
 Status: **experimental but production-usable**. The interception, credential-injection, and CA-delivery mechanism is complete and runs in production settings; what remains experimental is the configuration surface — extra ports and diagnostic switches may still change between releases.
 
-::: warning Internal OSEP-0023 bootstrap gate
+::: warning Internal OSEP-0023 revision runtime
 `OPENSANDBOX_EGRESS_EXPERIMENTAL_REVISION_RUNTIME=true` is a development-only,
-sidecar-profile gate for the OSEP-0023 revision protocol. Each mitmdump launch
-or restart receives a fresh authenticated process session and must acknowledge
-the current in-memory Vault snapshot (or the authoritative initial empty state)
-before health becomes ready. The default is off.
+sidecar-profile gate for the OSEP-0023 revision protocol. The default is off.
+Each mitmdump launch or child restart receives a fresh authenticated process
+session and must acknowledge the current in-memory Vault snapshot (or the
+authoritative initial empty state) with its committed Policy epoch before
+health becomes ready.
 
-The authenticated IPC backend jointly installs the immutable snapshot and its
-credential-free TLS selector view. Its connection and request admission remain
-disabled for the process lifetime, so install acknowledgements and active-revision
-readback confirm coherent state only. They do not report transport drain or
-completion of a public Vault mutation. Shutdown fences both views together.
+The live receiver jointly installs the immutable snapshot and its
+credential-free TLS selector view for connection and request admission. The
+internal sidecar experiment supports bound HTTPS/443 HTTP/1.1 traffic; it does
+not expose a supported public `interceptionMode` or enable Fast Sandbox or
+HTTP/2 support. See the [live admission boundary](/guides/credential-vault#experimental-live-credential-bound-admission-osep-0023).
 
-This gate does **not** enable credential-bound TLS selection. Existing traffic
-still uses intercept-all behavior and the conditional active-Vault lookup;
-connection fencing, Fast Sandbox, and the public `interceptionMode` contract are
-not wired to the revision protocol yet. To prevent the acknowledged bootstrap
-snapshot from diverging from the in-memory Vault, `POST`, `PATCH`, and `DELETE`
-on `/credential-vault` return `503` while this internal gate is enabled. An
-internal Go transaction owner now coordinates candidate installation and local
-Vault finalization, including fail-closed cleanup of the exact process generation
-on unresolved outcomes. It is not connected to these HTTP handlers and does not
-change the gate or provide transport-drain acknowledgement.
+Vault writes, existing `POST`/`PUT`/`PATCH`/`DELETE /policy` handlers and automatic
+always-rule reloads share the Policy/Vault mutation barrier and an exclusive
+live-session lease. Policy candidates validate all active bindings before any
+external effect and preserve the public Vault revision and already-rendered
+credentials. The Policy commit order is optional user-policy file persistence,
+nft application, exact receiver acknowledgement or reconciled readback, then
+Go proxy/base publication and API success. Reload skips user-policy persistence;
+the loader's accepted rules and metadata publish only after receiver confirmation.
+Failed reloads never rewrite operator-owned always files.
+
+These stages are not one atomic visibility boundary. In particular, nft rules
+can affect traffic before receiver acknowledgement. Once nft succeeded, even a
+definitive receiver rejection requires sticky recovery, quarantine and cleanup
+of the exact child/session. Reapplying the old nft policy is not proof that
+connections or requests created under the new rules were undone. A confirmed
+receiver update is finalized locally even if the HTTP request is then canceled;
+a lost API response does not roll back a committed update.
+
+Unavailable sessions, unconfirmed receiver outcomes and recovery-blocked writes
+return sanitized 503 responses. Existing initial file/nft failures may remain
+500; input validation stays 400 and the rule limit stays 413. A no-match DELETE
+or unchanged reload does not advance the internal Policy epoch, but cannot
+bypass recovery checks. Other committed writes may advance the epoch even when
+the content is equal. Later Vault mutations and bootstrap preserve that epoch.
+No epoch field, idempotency key or SDK method is added. `GET /policy` remains the
+last Go-published user policy, without always overlays, kernel state or an
+in-progress transaction indicator.
+
+Receiver acknowledgement covers publication and registration of old-request
+deadlines, not waiting for drain completion. The default is 30 seconds; later
+updates cannot extend the earliest old-request deadline. Expiry closes the
+whole tracked connection, potentially interrupting newer requests on it, while
+still-covered idle connections with no old requests remain usable. HTTP 101
+upgrades retain request admission and also drain on Policy-only changes. Actual
+closure follows the sweep and event loop, with failed closes retried. This does
+not promise termination of opaque or direct-IP established connections.
 
 The experimental lifecycle also keeps an authoritative policy base and a
 private bootstrap ticket under the shared policy/Vault barrier. Initial startup
@@ -245,8 +272,10 @@ does not establish kernel behavior or packet isolation.
 This state is in memory only. Readiness is not a network-traffic fence, and this
 increment provides no atomic policy-file/nft rollback, dynamic DNS-state recovery
 or whole-process crash durability. Restarting the entire sidecar loses the latch
-and is not a verified safe recovery procedure. Active policy epochs remain zero;
-legacy policy success responses are not revision transaction acknowledgements.
+and is not a verified safe recovery procedure. Internal Policy epochs advance
+only on committed Policy revisions and are retained by Vault writes and
+bootstrap. With the gate off, legacy policy success responses retain their
+existing meaning.
 :::
 
 ### Experimental runtime fault containment
@@ -258,8 +287,10 @@ or configuration surface. Normal policy, always-rule and internal Vault updates
 do not install a whole-IP fence. The independent fence is attempted through the
 recovery-required path, including an unknown external effect. A known
 `prepareRejected` or definitive `committed=false` result does not by itself add
-permanent isolation. Successful operations retain their existing behavior
-unless recovery was already required.
+permanent isolation when no local effect requires recovery. A Policy update
+that has already committed nft rules requires recovery and quarantine even
+with that definitive receiver rejection. Successful operations retain their
+existing behavior unless recovery was already required.
 
 An unexpected child death enters recovery only when the observation still
 matches the exact currently owned, running child generation. Stale, already

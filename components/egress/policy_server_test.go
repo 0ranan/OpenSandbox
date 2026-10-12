@@ -34,6 +34,7 @@ import (
 	"github.com/alibaba/opensandbox/egress/pkg/mitmproxy"
 	"github.com/alibaba/opensandbox/egress/pkg/nftables"
 	"github.com/alibaba/opensandbox/egress/pkg/policy"
+	"github.com/alibaba/opensandbox/egress/pkg/revision"
 	"github.com/stretchr/testify/require"
 )
 
@@ -719,11 +720,22 @@ func recoveryPolicyFixture(t *testing.T) *policyServer {
 	s.mitmGate = mitmproxy.NewHealthGate()
 	s.mitmGate.SetReady(true)
 	s.alwaysLoader = &stagedTestAlwaysLoader{}
+	attachPolicyTestSession(t, s)
 	return s
 }
 
+func attachPolicyTestSession(t *testing.T, s *policyServer) {
+	t.Helper()
+	session := &mutationTestSession{fakeRevisionProcessSession: fakeRevisionProcessSession{config: validFakeRevisionIPCConfig()}}
+	session.update = func(_ context.Context, snapshot credentialvault.ActiveSnapshot, epoch int64) (revision.Identity, error) {
+		return mutationIdentity(t, snapshot, epoch), nil
+	}
+	s.mitm = &mitmTransparent{running: &mitmproxy.Running{}, revisionSession: session, currentGen: 1,
+		revisionOwner: &revisionLaunchOwner{server: s, stop: func(*mitmproxy.Running) {}}}
+}
+
 func TestRevisionRecoveryPolicyEffectClassification(t *testing.T) {
-	for _, kind := range []string{"json", "binding", "read-file", "invalid-overlay", "persist", "nft-no-file", "nft-restored-file", "success-no-effects", "success-same-content", "success-reset", "success-nft", "success-file", "legacy-failure"} {
+	for _, kind := range []string{"json", "binding", "read-file", "unpublished-overlay-ignored", "persist", "nft-no-file", "nft-restored-file", "success-no-effects", "success-same-content", "success-reset", "success-nft", "success-file", "legacy-failure"} {
 		t.Run(kind, func(t *testing.T) {
 			if runtime.GOOS != "linux" && (kind == "success-file" || kind == "nft-restored-file") {
 				t.Skip("real experimental atomic policy storage requires Linux")
@@ -745,10 +757,9 @@ func TestRevisionRecoveryPolicyEffectClassification(t *testing.T) {
 			case "read-file":
 				s.policyFile = t.TempDir()
 				wantStatus, wantChanged = http.StatusInternalServerError, false
-			case "invalid-overlay":
+			case "unpublished-overlay-ignored":
+				// Only an acknowledged reload can replace the frozen overlay.
 				s.alwaysLoader.SetCurrentRules(nil, []policy.EgressRule{{Action: "invalid", Target: "invalid.example"}})
-				s.policyFile = filepath.Join(t.TempDir(), "policy.json")
-				wantStatus, wantChanged = http.StatusBadRequest, false
 			case "persist":
 				s.policyFile = filepath.Join(t.TempDir(), "missing", "policy.json")
 				wantStatus, wantChanged = http.StatusInternalServerError, false
@@ -830,7 +841,7 @@ func TestRevisionRecoveryPolicyEffectClassification(t *testing.T) {
 					require.ErrorIs(t, validateRecoveryTicket(s, ticket), errStaleRevisionBootstrap)
 					require.ErrorIs(t, validateRecoveryCandidate(s, candidate), errStaleEffectivePolicyCandidate)
 					require.Equal(t, wantDefault, s.revisionRecovery.current.inputs.user.DefaultAction)
-					require.Zero(t, s.revisionRecovery.current.epoch)
+					require.Equal(t, int64(1), s.revisionRecovery.current.epoch)
 					// The proxy exposes a mutable pointer; it must not alias the frozen base.
 					s.proxy.(*stubProxy).updated.DefaultAction = "tampered"
 					require.Equal(t, wantDefault, s.revisionRecovery.current.inputs.user.DefaultAction)
@@ -843,7 +854,7 @@ func TestRevisionRecoveryPolicyEffectClassification(t *testing.T) {
 			if !wantChanged {
 				require.Same(t, original, s.revisionRecovery.current)
 			}
-			if kind == "invalid-overlay" {
+			if kind == "unpublished-overlay-ignored" {
 				_, err := os.Stat(s.policyFile)
 				require.True(t, os.IsNotExist(err), "prebuild failure must occur before saving")
 			}
@@ -883,7 +894,7 @@ func (l *recoveryLockedAlwaysLoader) RefreshIfDueWithApply(now time.Time, apply 
 }
 
 func TestRevisionRecoveryAlwaysCallback(t *testing.T) {
-	for _, kind := range []string{"unchanged", "parse-error", "invalid-overlay", "binding", "nameserver-binding", "nft-failure", "success-nft", "success-no-nft"} {
+	for _, kind := range []string{"unchanged", "parse-error", "unpublished-overlay-ignored", "binding", "nameserver-binding", "nft-failure", "success-nft", "success-no-nft"} {
 		t.Run(kind, func(t *testing.T) {
 			s := recoveryPolicyFixture(t)
 			loader := &recoveryLockedAlwaysLoader{t: t, stagedTestAlwaysLoader: stagedTestAlwaysLoader{
@@ -902,7 +913,7 @@ func TestRevisionRecoveryAlwaysCallback(t *testing.T) {
 				loader.pending = false
 			case "parse-error":
 				loader.refreshErr = errors.New("parse failed")
-			case "invalid-overlay":
+			case "unpublished-overlay-ignored":
 				loader.candidateAllow = []policy.EgressRule{{Action: "invalid", Target: "invalid.example"}}
 			case "binding", "nameserver-binding":
 				s.credentialVault = policyCandidateStore(t, policyCandidateInputs(t))
@@ -955,7 +966,7 @@ func TestRevisionRecoveryAlwaysCallback(t *testing.T) {
 					baseAllowV4, _, _, _ := basePolicy.StaticIPSets()
 					require.NotContains(t, baseAllowV4, "192.0.2.53", "nameserver allowances belong only to nft derivation")
 				}
-				require.Zero(t, s.revisionRecovery.current.epoch)
+				require.Equal(t, int64(1), s.revisionRecovery.current.epoch)
 				require.False(t, s.mitmGate.MitmPending())
 			} else {
 				if kind == "unchanged" {

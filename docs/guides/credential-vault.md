@@ -535,7 +535,8 @@ If you have existing bindings that use `ports` to narrow scope, migrate them to 
 ::: warning Experimental boundary
 The live credential-bound loop is an internal sidecar experiment, not a
 supported deployment mode. It is documented here to bound what the current
-implementation actually does; no public configuration surface is added.
+implementation actually does; the gate remains off by default and no public
+configuration surface is added.
 :::
 
 When the experimental revision runtime is enabled, the sidecar installs an
@@ -550,9 +551,10 @@ authenticated IPC channel and admits traffic per connection and per request:
   unknown external effects (a mutation whose remote result cannot be
   confirmed, a session cleanup failure, an unexpected child exit) latches a
   permanent recovery-required state: readiness drops, outstanding bootstrap
-  tickets are invalidated, nft writes are quiesced, and quarantine contains.
-  The same sidecar cannot bootstrap a fresh revision session afterwards;
-  recovery requires replacing the whole sidecar.
+  tickets are invalidated, nft writes are quiesced, and quarantine is attempted.
+  Packet isolation is established only when quarantine is confirmed. The same
+  sidecar cannot bootstrap a fresh revision session afterwards; a whole-sidecar
+  restart is not a verified safe recovery procedure.
 - **Request admission and cutover.** A vault mutation is applied to the live
   receiver first and published publicly only after exact confirmation.
   A rendered snapshot exceeding the IPC size limit is rejected with HTTP 400
@@ -565,13 +567,48 @@ authenticated IPC channel and admits traffic per connection and per request:
   inside the bounded drain window — deletion does not recall requests the
   remote origin already received or revoke credentials already delivered
   remotely.
+- **Policy updates share the revision barrier.** Existing
+  `POST`/`PUT`/`PATCH`/`DELETE /policy` operations and automatic
+  `deny.always` / `allow.always` reloads validate the complete Policy/Vault pair.
+  A policy that would deny any active binding is rejected before file, nft or
+  receiver effects. A policy-only update preserves the public Vault revision,
+  pinned credential bytes and bindings; it does not reread credential sources.
+  Its commit order is optional user-policy file persistence, nft application,
+  exact receiver confirmation, then Go proxy/base publication and API success.
+  Reload skips user-policy persistence and publishes the accepted loader view
+  only after receiver confirmation. Subsequent Vault writes and bootstraps use
+  the committed internal Policy epoch rather than resetting it to zero.
+- **Policy visibility and failure.** Disk, nft and receiver updates are not
+  instantaneously atomic: new nft rules may affect traffic before receiver
+  confirmation. A receiver failure after successful nft application requires
+  sticky recovery, quarantine and exact-child cleanup, even if the receiver
+  definitively rejected the candidate. Replaying old nft rules or restoring
+  the file cannot prove that new connections or requests were undone.
+  Unavailable or unconfirmed revision updates and recovery-blocked writes
+  return a fixed, sanitized 503; the initial file/nft error may still be 500.
+  Validation failures before effects do not themselves require recovery.
+- **Policy no-ops and retries.** A DELETE with no matching target and an
+  unchanged always-rule reload do not advance the internal Policy epoch, but
+  cannot bypass recovery checks. Other committed writes, including equal
+  content or a loader-detected rewrite, can advance the epoch and initiate
+  another drain. No public epoch, Policy idempotency key or new SDK method is
+  added. `GET /policy` reports the last Go-published user policy, not an
+  in-progress transaction, always-rule overlay or packet-isolation status.
 - **Drain accounting.** Retired transports carry a bounded retirement
   deadline (default 30 seconds, internal range 1–300). The drain sweep pages
   expired transports and closes them; a failed close is retried on the next
   sweep rather than extending the deadline. An HTTP 101 protocol upgrade
   (including WebSocket) retains its request admission until the connection
-  disconnects, so credential rotation also drains an upgraded transport even
-  when its host remains bound.
+  disconnects, so credential rotation and policy-only changes also drain an
+  upgraded transport even when its host remains bound. API success waits for
+  publication and retirement-deadline registration, not for the 30-second
+  window to elapse. Repeated updates never extend an older request's earliest
+  deadline. A still-covered connection may admit new-revision requests, but
+  closing it for an expired old request also interrupts those newer requests.
+  A still-covered idle connection with no old request is not retired solely
+  because the Policy epoch changes. Sweep scheduling and failed-close retries
+  can delay actual closure; this is not a deadline for opaque or direct-IP
+  connections outside the registry.
 - **ECH is opaque pass-through.** A ClientHello carrying the
   `encrypted_client_hello` extension (0xfe0d), including GREASE forms, is
   forwarded untouched as an opaque tunnel without decryption;
@@ -590,10 +627,11 @@ authenticated IPC channel and admits traffic per connection and per request:
 - **Scope.** This mode is scoped to the internal sidecar profile:
   Docker DNS + nft enforcement, exact-host HTTPS on port 443, HTTP/1.1
   origin-form or matching absolute-form requests, and inline credentials
-  injected as headers. HTTP/2, the fast-sandbox profile, dynamic policy
-  reloads, and recovery across a complete sidecar replacement are out of
-  scope. Dynamic DNS learning and Kubernetes deployments are not covered by
-  this experiment's evidence.
+  injected as headers. HTTP/2, the fast-sandbox profile and recovery across a
+  complete sidecar replacement remain out of scope. Dynamic DNS learning and
+  Kubernetes deployments are not covered by this experiment's evidence.
+  Policy participation is part of this implementation; its acceptance evidence
+  is recorded separately from the earlier live-Vault checks below.
 
 The task-level acceptance record for this experiment lives in
 [Live Vault Acceptance](/guides/live-vault-acceptance).

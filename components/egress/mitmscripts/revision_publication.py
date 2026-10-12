@@ -37,6 +37,13 @@ class RevisionPublisher:
     planning completes before either active view changes. The public registry
     remains available for admission and lifecycle bookkeeping, but independent
     activate/deactivate and Receiver mutation are disabled for this owned pair.
+
+    A policy-only full revision registers the same retirement deadlines as a
+    Vault revision. Publication acknowledges the new request snapshot and those
+    deadlines, not completion of the drain: the transport owner later closes
+    the entire connection for any unfinished expired request. Idle connections
+    still covered by the unchanged selectors are not retired merely because
+    the policy epoch changed.
     """
 
     def __init__(
@@ -206,9 +213,11 @@ class LiveReceiver:
     Exclusively owns a fresh Publisher with real admission budgets, unlike
     InstallationReceiver which permanently disables admission. Commit publishes
     both views and the registry records fences and retirement deadlines for
-    newly uncovered connections; the transport owner that consumes
-    ``registry`` must drain those connections before a public mutation is
-    acknowledged. The IPC wire acknowledgement alone proves installation only.
+    uncovered connections and old in-flight requests, including policy-only
+    revisions. Installation and registered deadlines satisfy the receiver's
+    public-mutation ACK condition; the transport owner consumes ``registry``
+    and closes expired whole connections asynchronously. The Go owner still
+    completes its local effects and publication before returning API success.
     """
 
     def __init__(

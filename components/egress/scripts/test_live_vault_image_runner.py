@@ -399,6 +399,122 @@ class MainFlowTests(RunnerCase):
         )
 
 
+class PolicyRevisionImageTests(RunnerCase):
+    def test_required_cases_include_every_policy_acceptance_case(self) -> None:
+        self.assertEqual(len(runner.REQUIRED), len(set(runner.REQUIRED)))
+        self.assertTrue({
+            "TestPolicyRevisionAPIMutations", "TestPolicyRevisionRejectsBoundDeny",
+            "TestAlwaysReloadRevision", "TestPolicyOnlyDrain", "TestPolicyThenVaultMutation",
+        }.issubset(runner.REQUIRED))
+
+    def test_default_drain_uses_production_default_and_owned_rule_directory(self) -> None:
+        self.runtime.drain_seconds = 30
+        with mock.patch.object(self.runtime, "wait_origin"), mock.patch.object(self.runtime, "wait_health"):
+            self.runtime.__enter__()
+        launched = next(call for call in self.docker.calls
+                        if call[:4] == ("run", "-d", "--name", self.runtime.egress))
+        self.assertIn(str(self.runtime.rulesdir) + ":/var/egress/rules", launched)
+        self.assertFalse(any("DRAIN_TIMEOUT_SECONDS=" in arg for arg in launched))
+        self.assertTrue(self.runtime.rulesdir.is_relative_to(self.runtime.workdir))
+
+    def test_short_drain_is_an_explicit_supplemental_override(self) -> None:
+        with mock.patch.object(self.runtime, "wait_origin"), mock.patch.object(self.runtime, "wait_health"):
+            self.runtime.__enter__()
+        launched = next(call for call in self.docker.calls
+                        if call[:4] == ("run", "-d", "--name", self.runtime.egress))
+        self.assertIn("OPENSANDBOX_EGRESS_REVISION_DRAIN_TIMEOUT_SECONDS=2", launched)
+
+    def test_reload_logs_include_stderr(self) -> None:
+        self.docker.queue("logs", self.runtime.egress,
+                          result=_completed(0, "stdout", "stderr reload applied"))
+        self.assertEqual("stdoutstderr reload applied", self.runtime.egress_logs())
+
+    def _drain_outcomes(self, terminal="eof", elapsed=29.9):
+        return [{"status": 101}, {"status": 200},
+                {"outcome": "timeout", "bytes": 4, "elapsed_s": 0.25},
+                {"outcome": terminal, "elapsed_s": elapsed},
+                {"status": 200, "private_token_matches": True}]
+
+    def test_policy_drain_requires_real_terminal_state_and_default_window(self) -> None:
+        self.runtime.drain_seconds = 30
+        for terminal, elapsed, passes in (("eof", 29.9, True), ("reset", 29.9, True),
+                                          ("timeout", 34, False), ("data", 30, False),
+                                          ("eof", 1, False), ("eof", 35, False)):
+            with self.subTest(terminal=terminal, elapsed=elapsed), \
+                 mock.patch.object(runner, "public_state", return_value=({}, {"revision": 7})), \
+                 mock.patch.object(self.runtime, "client", return_value=self._drain_outcomes(terminal, elapsed)) as call:
+                if passes:
+                    runner.policy_only_drain(self.runtime)
+                else:
+                    with self.assertRaises(runner.Failure):
+                        runner.policy_only_drain(self.runtime)
+                plan = call.call_args.args[0]["requests"]
+                self.assertEqual("/policy", plan[1]["vault_api"]["path"])
+                self.assertEqual(34, plan[3]["duration_s"])
+
+    def test_policy_drain_rejects_vault_change_and_same_length_wrong_secret(self) -> None:
+        self.runtime.drain_seconds = 30
+        for change_vault in (False, True):
+            outcomes = self._drain_outcomes()
+            outcomes[-1]["private_token_matches"] = change_vault
+            states = [({}, {"revision": 7}), ({}, {"revision": 8})]
+            with mock.patch.object(runner, "public_state", side_effect=states), \
+                 mock.patch.object(self.runtime, "client", return_value=outcomes), \
+                 self.assertRaises(runner.Failure):
+                runner.policy_only_drain(self.runtime)
+
+    def test_always_reload_uses_both_real_files_and_preserves_prior_view(self) -> None:
+        self.runtime.rulesdir.mkdir()
+        self.runtime.subnet = "192.168.207.0/24"
+        applied = "policy API: reloaded always rules applied\n"
+        rejected = "policy API: periodic reload of always rules failed\n"
+        logs = ["", applied, applied, applied + rejected,
+                applied + rejected, applied + rejected + applied]
+        bound = {"status": 200, "private_token_matches": True}
+        responses = [[{"status": 204}, {"status": 201}, {"status": 200}], [bound], [bound]]
+        with mock.patch.object(self.runtime, "client", side_effect=responses) as call, \
+             mock.patch.object(self.runtime, "egress_logs", side_effect=logs), \
+             mock.patch.object(runner, "public_state", return_value=({}, {"revision": 1})), \
+             mock.patch.object(runner, "probe_badcert") as probe:
+            runner.always_reload(self.runtime)
+        ip = self.runtime.origin_addresses()[1]
+        self.assertEqual(ip + "\n", (self.runtime.rulesdir / "allow.always").read_text())
+        self.assertEqual(ip + "\n", (self.runtime.rulesdir / "deny.always").read_text())
+        self.assertEqual([False, True, True, False], [item.args[2] for item in probe.call_args_list])
+        paths = [req["vault_api"]["path"] for call_args in call.call_args_list
+                 for req in call_args.args[0]["requests"] if "vault_api" in req]
+        self.assertEqual(["/credential-vault", "/credential-vault", "/policy"], paths)
+
+    def test_always_reload_missing_real_job_fails_with_bounded_poll(self) -> None:
+        self.runtime.rulesdir.mkdir()
+        self.runtime.subnet = "192.168.207.0/24"
+        with mock.patch.object(self.runtime, "client", return_value=[{"status": 204}, {"status": 201}, {"status": 200}]), \
+             mock.patch.object(self.runtime, "egress_logs", return_value=""), \
+             mock.patch.object(self.runtime, "health", return_value="200"), \
+             mock.patch.object(runner, "public_state", return_value=({}, {"revision": 1})), \
+             mock.patch.object(runner, "probe_badcert"), \
+             mock.patch.object(runner.time, "monotonic", side_effect=[0, 1, 86]), \
+             mock.patch.object(runner.time, "sleep") as sleep, \
+             self.assertRaisesRegex(runner.Failure, "real periodic reload never produced"):
+            runner.always_reload(self.runtime)
+        sleep.assert_called_once_with(2)
+
+    def test_failed_run_preserves_sanitized_logs_before_cleanup(self) -> None:
+        self.runtime.created.add(self.runtime.egress)
+        self.docker.queue("logs", self.runtime.egress,
+                          result=_completed(0, runner.SECRET_ONE, runner.TOKEN))
+        for name in (self.runtime.egress, self.runtime.origin, self.runtime.badcert):
+            self.docker.queue("container", "inspect", name, result=NOT_FOUND)
+        self.docker.queue("network", "inspect", self.runtime.network, result=NOT_FOUND)
+        self.runtime.__exit__(RuntimeError, RuntimeError("body failed"), None)
+        log = (self.artifacts / "egress-logs.txt").read_text()
+        self.assertNotIn(runner.SECRET_ONE, log)
+        self.assertNotIn(runner.TOKEN, log)
+        self.assertIn("[REDACTED]", log)
+        self.assertLess(self.docker.calls.index(("logs", self.runtime.egress)),
+                        self.docker.calls.index(("rm", "-f", self.runtime.egress)))
+
+
 class _FakeSock:
     """Records calls; recv behavior is scripted per construction."""
 
@@ -477,6 +593,55 @@ class LiveVaultClientIdleReadTests(unittest.TestCase):
         client.with_suppressed(sock.settimeout, 1.25)
         self.assertEqual(1.25, sock.gettimeout())
         client.with_suppressed(sock.recv, 1)  # raises socket.timeout, swallowed
+
+
+class LiveVaultClientPolicyTests(unittest.TestCase):
+    def test_credential_comparison_checks_bytes_without_returning_them(self) -> None:
+        for matches in (False, True):
+            secret = runner.SECRET_ONE if matches else "x" * len(runner.SECRET_ONE)
+            response = mock.Mock(status=200)
+            response.read.return_value = json.dumps({"private_token": secret}).encode()
+            response.getheader.return_value = ""
+            connection = mock.Mock()
+            connection.getresponse.return_value = response
+            connection.sock.getsockname.return_value = ("127.0.0.1", 12345)
+            with mock.patch.object(client.http.client, "HTTPSConnection", return_value=connection), \
+                 mock.patch.object(client, "trust_context"):
+                result = client.perform_one({"host": runner.BOUND, "port": 4443,
+                                             "expected_private_token": runner.SECRET_ONE}, [])
+            self.assertIs(matches, result["private_token_matches"])
+            result.pop("_connection")
+            self.assertNotIn(secret, json.dumps(result))
+
+    def test_stream_read_requires_eof_or_reset_and_restores_timeout(self) -> None:
+        for behavior, expected in (("eof", "eof"), ("reset", "reset"), ("timeout", "timeout")):
+            sock = _FakeSock(behavior)
+            result = client.perform_stream_read(
+                {"keepalive_with": 0, "duration_s": 1}, [types.SimpleNamespace(sock=sock)],
+            )
+            self.assertEqual(expected, result["outcome"])
+            self.assertEqual(5.0, sock.gettimeout())
+            self.assertEqual([], sock.sent)
+
+    def test_stream_read_oserror_is_not_falsely_reported_as_closed(self) -> None:
+        sock = _FakeSock("eof")
+        sock.recv = mock.Mock(side_effect=OSError("unrelated socket error"))
+        result = client.perform_stream_read(
+            {"keepalive_with": 0, "duration_s": 1}, [types.SimpleNamespace(sock=sock)],
+        )
+        self.assertNotIn("outcome", result)
+        self.assertIn("error", result)
+        self.assertEqual(5.0, sock.gettimeout())
+
+    def test_stream_read_consumes_heartbeat_without_writing(self) -> None:
+        sock = _FakeSock("eof")
+        sock.recv = mock.Mock(side_effect=[b"tick", b""])
+        result = client.perform_stream_read(
+            {"keepalive_with": 0, "duration_s": 1}, [types.SimpleNamespace(sock=sock)],
+        )
+        self.assertEqual("eof", result["outcome"])
+        self.assertEqual(4, result["bytes"])
+        self.assertEqual([], sock.sent)
 
 
 if __name__ == "__main__":

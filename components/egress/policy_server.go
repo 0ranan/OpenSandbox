@@ -416,9 +416,8 @@ func (s *policyServer) handleCredentialVaultDelete(w http.ResponseWriter, r *htt
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// revisionMutationTimeout bounds one live Vault mutation transaction, including
-// indeterminate-outcome reconciliation. The transaction holds the policy
-// barrier for its full duration, so the bound also bounds that stall.
+// revisionMutationTimeout is the cooperative nft/IPC budget for live mutations.
+// Mutex waits, synchronous filesystem calls and stop/reap have no hard bound.
 const revisionMutationTimeout = 10 * time.Second
 
 // setRevisionMitm attaches the sidecar's mitmdump lifecycle owner for the
@@ -514,8 +513,6 @@ func (s *policyServer) mutateRevisionVaultRequest(
 	r *http.Request,
 	prepare func(*credentialvault.Store, *policy.NetworkPolicy) (*credentialvault.MutationCandidate, error),
 ) (credentialvault.State, error) {
-	ctx, cancel := context.WithTimeout(r.Context(), revisionMutationTimeout)
-	defer cancel()
 	var m *mitmTransparent
 	s.mu.Lock()
 	m = s.revisionMitmLocked()
@@ -523,6 +520,8 @@ func (s *policyServer) mutateRevisionVaultRequest(
 	if m == nil {
 		return credentialvault.State{}, revision.ErrTransportUnavailable
 	}
+	ctx, cancel := revisionMutationContext(r.Context(), m)
+	defer cancel()
 	return s.mutateRevisionVault(ctx, m, prepare)
 }
 
@@ -623,6 +622,10 @@ func (s *policyServer) handlePost(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.checkRevisionPolicyAvailableLocked(r.Context()); err != nil {
+		writeRevisionPolicyError(w, err)
+		return
+	}
 
 	raw, err := readPolicyRequestBody(r)
 	if err != nil {
@@ -685,6 +688,10 @@ func (s *policyServer) handlePatch(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.checkRevisionPolicyAvailableLocked(r.Context()); err != nil {
+		writeRevisionPolicyError(w, err)
+		return
+	}
 
 	raw, err := readPolicyRequestBody(r)
 	if err != nil {
@@ -710,7 +717,11 @@ func (s *policyServer) handlePatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	newPolicy, err := patchMergedPolicy(s.proxy.CurrentPolicy(), patchRules)
+	current := s.proxy.CurrentPolicy()
+	if s.revisionRecovery != nil {
+		current = s.revisionRecovery.current.inputs.user
+	}
+	newPolicy, err := patchMergedPolicy(current, patchRules)
 	if err != nil {
 		logEgressUpdateFailedWarn(fmt.Sprintf("invalid merged policy: %v", err))
 		http.Error(w, fmt.Sprintf("invalid merged policy: %v", err), http.StatusBadRequest)
@@ -743,6 +754,10 @@ func (s *policyServer) handleDelete(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.checkRevisionPolicyAvailableLocked(r.Context()); err != nil {
+		writeRevisionPolicyError(w, err)
+		return
+	}
 
 	raw, err := readPolicyRequestBody(r)
 	if err != nil {
@@ -769,6 +784,9 @@ func (s *policyServer) handleDelete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	base := s.proxy.CurrentPolicy()
+	if s.revisionRecovery != nil {
+		base = s.revisionRecovery.current.inputs.user
+	}
 	if base == nil {
 		base = policy.DefaultDenyPolicy()
 	}
@@ -822,27 +840,35 @@ func (s *policyServer) handleDelete(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// commitPolicy applies one logical change: optional disk persist → merge always file rules → nft
-// static (with nameserver allow-IPs) → then update in-memory user policy (POST/PATCH/GET view).
-// Experimental persistence uses atomic replacement and stage-aware recovery.
-// Best-effort restoration never clears an uncertain external-effect latch.
+// commitPolicy applies one change under s.mu. The experimental branch holds
+// its process lease through disk → nft → exact receiver ACK → proxy/base.
+// The default-off legacy branch retains its existing disk/nft/proxy behavior.
 func (s *policyServer) commitPolicy(ctx context.Context, w http.ResponseWriter, pol *policy.NetworkPolicy, op string) bool {
-	alwaysDeny, alwaysAllow := s.currentAlwaysRules()
-	stagedBase, err := s.prepareRevisionBaseReplacementLocked(effectivePolicyInputs{user: pol, alwaysDeny: alwaysDeny, alwaysAllow: alwaysAllow})
-	if err != nil {
-		status := http.StatusBadRequest
-		if errors.Is(err, errRevisionRecoveryRequired) {
-			status = http.StatusServiceUnavailable
+	if s.revisionRecovery != nil {
+		m := s.revisionMitmLocked()
+		if m == nil {
+			writeRevisionPolicyError(w, revision.ErrTransportUnavailable)
+			return false
 		}
-		http.Error(w, "revision policy publication unavailable", status)
-		return false
+		ctx, cancel := revisionMutationContext(ctx, m)
+		defer cancel()
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		// The immutable committed base, not mutable proxy/loader views, owns
+		// accepted overlays between explicit always-file reloads.
+		inputs := s.revisionRecovery.current.inputs
+		inputs.user = pol
+		base, err := s.applyRevisionPolicyLocked(ctx, m, inputs, true)
+		if err != nil {
+			writeRevisionPolicyError(w, err)
+			return false
+		}
+		s.proxy.UpdatePolicy(policy.MergeAlwaysOverlay(base.inputs.user, nil, nil))
+		s.revisionRecovery.current = base
+		s.invalidateRevisionBootstrapLocked()
+		return true
 	}
-	if stagedBase != nil {
-		// Use the same frozen inputs for disk, nft and the authoritative base.
-		frozen := cloneEffectivePolicyInputs(stagedBase.inputs)
-		pol = frozen.user
-		alwaysDeny, alwaysAllow = frozen.alwaysDeny, frozen.alwaysAllow
-	}
+	alwaysDeny, alwaysAllow := s.currentAlwaysRules()
 	restore, persistErr := s.persistPolicyChangeLocked(pol)
 	if persistErr != nil {
 		logEgressUpdateFailedError(fmt.Sprintf("persist policy: %v", persistErr))
@@ -856,18 +882,9 @@ func (s *policyServer) commitPolicy(ctx context.Context, w http.ResponseWriter, 
 		nftCtx, nftCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer nftCancel()
 		if err := s.nft.ApplyStatic(nftCtx, merged.WithExtraAllowIPs(s.nameserverIPs)); err != nil {
-			if s.revisionRecovery != nil && nftables.ApplyEffectOf(err) != nftables.ApplyUnchanged {
-				s.requireRevisionRecoveryLocked(revisionRecoveryExternalEffectsUnknown)
-			}
 			logEgressUpdateFailedError(fmt.Sprintf("nftables apply (%s): %v", op, err))
 			log.Errorf("policy API: nftables apply failed (%s): %v", op, err)
-			// Known no-execution failure can remain retryable only after the
-			// exact old file (or absence) has been durably restored. Unknown
-			// kernel effects have already latched recovery before this attempt.
 			if restoreErr := restore(); restoreErr != nil {
-				if s.revisionRecovery != nil && nftables.ApplyEffectOf(err) == nftables.ApplyUnchanged {
-					s.requireRevisionRecoveryLocked(revisionRecoveryExternalEffectsUnknown)
-				}
 				log.Errorf("policy API: restore policy file after failed apply: %v", restoreErr)
 			}
 			http.Error(w, fmt.Sprintf("failed to apply nftables policy: %v", err), http.StatusInternalServerError)
@@ -875,10 +892,6 @@ func (s *policyServer) commitPolicy(ctx context.Context, w http.ResponseWriter, 
 		}
 	}
 	s.proxy.UpdatePolicy(pol)
-	if stagedBase != nil {
-		s.revisionRecovery.current = stagedBase
-		s.invalidateRevisionBootstrapLocked()
-	}
 	return true
 }
 
@@ -927,48 +940,55 @@ func fingerprintRules(deny, allow []policy.EgressRule) uint64 {
 }
 
 func (s *policyServer) reloadAlwaysRules() (bool, error) {
-	if s.alwaysLoader == nil {
-		return false, nil
-	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.revisionRecovery.recoveryErrorLocked(); err != nil {
 		return false, err
 	}
+	var m *mitmTransparent
+	ctx := context.Background()
+	if s.revisionRecovery != nil {
+		m = s.revisionMitmLocked()
+		if m == nil {
+			return false, revision.ErrTransportUnavailable
+		}
+		var cancel context.CancelFunc
+		ctx, cancel = revisionMutationContext(ctx, m)
+		defer cancel()
+		// Hold the lease through callback AND loader/proxy/base finalization.
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if err := s.revisionPolicySessionReadyLocked(ctx, m); err != nil {
+			return false, err
+		}
+	}
+	if s.alwaysLoader == nil {
+		return false, nil
+	}
 	var stagedBase *effectivePolicyBase
 	var stagedAllow []policy.EgressRule
 	deny, _, changed, err := s.alwaysLoader.RefreshIfDueWithApply(time.Now(), func(deny, allow []policy.EgressRule) error {
-		// The loader holds its own write lock here. All validation and effects
-		// use explicit inputs, never CurrentRules/effectivePolicy reentry.
+		// Loader holds its write lock. Resolve telemetry once and never reenter it.
 		stagedAllow = withTelemetryAllow(allow)
 		if s.nft == nil && s.revisionRecovery == nil {
 			return nil
 		}
 		current := s.proxy.CurrentPolicy()
+		if s.revisionRecovery != nil {
+			current = s.revisionRecovery.current.inputs.user
+		}
 		if current == nil {
 			current = policy.DefaultDenyPolicy()
 		}
-		var err error
-		stagedBase, err = s.prepareRevisionBaseReplacementLocked(effectivePolicyInputs{user: current, alwaysDeny: deny, alwaysAllow: stagedAllow})
-		if err != nil {
+		if s.revisionRecovery != nil {
+			var err error
+			stagedBase, err = s.applyRevisionPolicyLocked(ctx, m, effectivePolicyInputs{user: current, alwaysDeny: deny, alwaysAllow: stagedAllow}, false)
 			return err
 		}
-		if stagedBase != nil {
-			frozen := cloneEffectivePolicyInputs(stagedBase.inputs)
-			current = frozen.user
-			deny, stagedAllow = frozen.alwaysDeny, frozen.alwaysAllow
-		}
-		if s.nft == nil {
-			return nil
-		}
 		merged := policy.MergeAlwaysOverlay(current, deny, stagedAllow)
-		s.invalidateRevisionBootstrapLocked()
 		nftCtx, nftCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer nftCancel()
 		if err := s.nft.ApplyStatic(nftCtx, merged.WithExtraAllowIPs(s.nameserverIPs)); err != nil {
-			if s.revisionRecovery != nil && nftables.ApplyEffectOf(err) != nftables.ApplyUnchanged {
-				s.requireRevisionRecoveryLocked(revisionRecoveryExternalEffectsUnknown)
-			}
 			log.Warnf("policy API: apply reloaded always rules to nftables failed: %v", err)
 			return err
 		}
@@ -982,6 +1002,7 @@ func (s *policyServer) reloadAlwaysRules() (bool, error) {
 	}
 	if stagedBase != nil {
 		deny = append([]policy.EgressRule(nil), stagedBase.inputs.alwaysDeny...)
+		stagedAllow = append([]policy.EgressRule(nil), stagedBase.inputs.alwaysAllow...)
 	}
 	s.setAlwaysRules(deny, stagedAllow)
 	s.proxy.UpdateAlwaysRules(deny, stagedAllow)
@@ -1016,7 +1037,8 @@ func (s *policyServer) effectivePolicy() *policy.NetworkPolicy {
 }
 
 func (s *policyServer) validateCredentialVaultPolicyUpdate(pol *policy.NetworkPolicy) error {
-	if s.credentialVault == nil {
+	// The revision owner validates the frozen candidate once, before any effects.
+	if s.credentialVault == nil || s.revisionRecovery != nil {
 		return nil
 	}
 	alwaysDeny, alwaysAllow := s.currentAlwaysRules()
