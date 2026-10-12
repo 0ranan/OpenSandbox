@@ -27,7 +27,10 @@ import {
   createRedirectSafeFetch,
   hasProtectedHeaders,
   isSameOrigin,
+  stripCredentialHeaders,
   stripProtectedHeaders,
+  _resetClientIpCacheForTest,
+  _setClientIpForTest,
 } from "../dist/internal.js";
 
 /** Start a throwaway HTTP server on an ephemeral 127.0.0.1 port. */
@@ -61,6 +64,18 @@ test("protected header helpers are case-insensitive and origin-aware", () => {
   assert.equal(headers.has("opensandbox-egress-auth"), false);
   assert.equal(headers.get("x-custom"), "keep");
   assert.equal(hasProtectedHeaders(new Headers({ "X-Custom": "keep" })), false);
+
+  const creds = new Headers({
+    authorization: "Bearer t",
+    cookie: "session=1",
+    "proxy-authorization": "Basic p",
+    "x-keep": "v",
+  });
+  stripCredentialHeaders(creds);
+  assert.equal(creds.has("authorization"), false);
+  assert.equal(creds.has("cookie"), false);
+  assert.equal(creds.has("proxy-authorization"), false);
+  assert.equal(creds.get("x-keep"), "v");
 
   assert.equal(isSameOrigin(new URL("https://a.test/x"), new URL("https://a.test:443/y")), true);
   assert.equal(isSameOrigin(new URL("http://a.test/x"), new URL("http://a.test:80/y")), true);
@@ -104,6 +119,101 @@ test("cross-origin redirect strips protected headers but keeps other headers", a
     await source.close();
     await target.close();
   }
+});
+
+test("cross-origin redirect strips standard credential headers too", async () => {
+  const calls = [];
+  const baseFetch = async (input, init) => {
+    const request = new Request(input, init);
+    calls.push(Object.fromEntries(request.headers));
+    if (calls.length === 1) {
+      return new Response(null, { status: 302, headers: { location: "http://other.test/final" } });
+    }
+    return new Response("ok", { status: 200 });
+  };
+  const safeFetch = createRedirectSafeFetch("http://a.test", baseFetch);
+
+  await safeFetch("http://a.test/start", {
+    headers: {
+      "OPEN-SANDBOX-API-KEY": "tenant-secret",
+      Authorization: "Bearer user-token",
+      Cookie: "session=abc",
+      "X-Custom": "keep-me",
+    },
+  });
+
+  assert.equal(calls.length, 2);
+  // The configured origin still receives everything.
+  assert.equal(calls[0]["authorization"], "Bearer user-token");
+  assert.equal(calls[0]["cookie"], "session=abc");
+  // The cross-origin hop drops standard credentials (mirroring native fetch).
+  assert.equal(calls[1]["authorization"], undefined);
+  assert.equal(calls[1]["cookie"], undefined);
+  assert.equal(calls[1]["open-sandbox-api-key"], undefined);
+  // Non-credential headers survive.
+  assert.equal(calls[1]["x-custom"], "keep-me");
+});
+
+test("307/308 redirects replay a Request body instead of surfacing the 3xx", async () => {
+  const calls = [];
+  const baseFetch = async (input, init) => {
+    const request = new Request(input, init);
+    calls.push({ url: request.url, method: request.method, body: await request.text() });
+    if (calls.length === 1) {
+      return new Response(null, { status: 308, headers: { location: "http://other.test/final" } });
+    }
+    return new Response("ok", { status: 200 });
+  };
+  const safeFetch = createRedirectSafeFetch("http://a.test", baseFetch);
+
+  // openapi-fetch passes a Request object carrying a JSON body.
+  const payload = JSON.stringify({ name: "sandbox" });
+  const request = new Request("http://a.test/start", {
+    method: "POST",
+    headers: { "content-type": "application/json", "OPEN-SANDBOX-API-KEY": "tenant-secret" },
+    body: payload,
+  });
+
+  const res = await safeFetch(request);
+  assert.equal(res.status, 200);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].method, "POST");
+  assert.equal(calls[1].method, "POST");
+  assert.equal(calls[1].url, "http://other.test/final");
+  assert.equal(calls[1].body, payload);
+});
+
+test("the request signal is carried across redirected hops", async () => {
+  const controller = new AbortController();
+  const signals = [];
+  const baseFetch = async (input, init) => {
+    const request = new Request(input, init);
+    signals.push(request.signal);
+    if (signals.length === 1) {
+      return new Response(null, { status: 302, headers: { location: "http://other.test/final" } });
+    }
+    // Simulate a stalled target that only settles on abort.
+    await Promise.race([
+      new Promise((resolve) =>
+        request.signal.addEventListener("abort", resolve, { once: true }),
+      ),
+      new Promise((resolve) => setTimeout(resolve, 2000)),
+    ]);
+    if (request.signal.aborted) throw request.signal.reason;
+    return new Response("late", { status: 200 });
+  };
+  const safeFetch = createRedirectSafeFetch("http://a.test", baseFetch);
+
+  const request = new Request("http://a.test/start", {
+    headers: { "OPEN-SANDBOX-API-KEY": "tenant-secret" },
+    signal: controller.signal,
+  });
+  const promise = safeFetch(request);
+  setTimeout(() => controller.abort(new Error("cancelled")), 10);
+
+  await assert.rejects(promise, /cancelled/);
+  assert.equal(signals.length, 2);
+  assert.equal(signals[1].aborted, true);
 });
 
 test("same-origin redirect preserves protected headers", async () => {
@@ -304,6 +414,42 @@ test("DefaultAdapterFactory strips protected headers on cross-origin data-plane 
     assert.equal(await execd.health.ping(), true);
     assert.equal(targetHeaders["opensandbox-egress-auth"], undefined);
   } finally {
+    await source.close();
+    await target.close();
+  }
+});
+
+test("cross-origin hops drop the client-IP header added by the transport", async () => {
+  let sourceHeaders;
+  let targetHeaders;
+  const target = await startServer((req, res) => {
+    targetHeaders = req.headers;
+    res.writeHead(200, { "content-type": "text/plain" });
+    res.end("ok");
+  });
+  const source = await startServer((req, res) => {
+    sourceHeaders = req.headers;
+    res.writeHead(302, { location: `${target.origin}/ping` });
+    res.end();
+  });
+
+  _setClientIpForTest("10.9.8.7");
+  const connectionConfig = new ConnectionConfig({ domain: "unused.test" }).withTransportIfMissing();
+  try {
+    const execd = new DefaultAdapterFactory().createExecdStack({
+      connectionConfig,
+      execdBaseUrl: source.origin,
+      endpointHeaders: { "OPENSANDBOX-EGRESS-AUTH": "egress-secret" },
+    });
+
+    assert.equal(await execd.health.ping(), true);
+    // The configured origin still sees the SDK host's IP...
+    assert.equal(sourceHeaders["open-sandbox-client-ip"], "10.9.8.7");
+    // ...but the redirect target does not.
+    assert.equal(targetHeaders["open-sandbox-client-ip"], undefined);
+  } finally {
+    await connectionConfig.closeTransport();
+    _resetClientIpCacheForTest();
     await source.close();
     await target.close();
   }

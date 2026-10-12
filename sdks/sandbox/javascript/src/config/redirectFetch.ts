@@ -13,6 +13,7 @@
 // limitations under the License.
 
 import { SandboxApiException } from "../core/exceptions.js";
+import { SUPPRESS_CLIENT_IP } from "./connection.js";
 
 /**
  * Cross-origin redirect protection for protected OpenSandbox headers.
@@ -34,6 +35,18 @@ import { SandboxApiException } from "../core/exceptions.js";
 export const PROTECTED_HEADER_PREFIXES: readonly string[] = [
   "open-sandbox-",
   "opensandbox-",
+];
+
+/**
+ * Standard credential headers that native `fetch` (and httpx) drop when a
+ * redirect crosses origins. The manual loop must mirror this, otherwise a
+ * caller-supplied `Authorization`/`Cookie` would be replayed further than the
+ * built-in redirect handling would.
+ */
+export const CROSS_ORIGIN_CREDENTIAL_HEADERS: readonly string[] = [
+  "authorization",
+  "cookie",
+  "proxy-authorization",
 ];
 
 const DEFAULT_PORTS: Readonly<Record<string, string>> = {
@@ -70,6 +83,11 @@ export function stripProtectedHeaders(headers: Headers): void {
     if (isProtectedHeaderName(name)) names.push(name);
   });
   for (const name of names) headers.delete(name);
+}
+
+/** Remove the standard credential headers native fetch strips cross-origin. */
+export function stripCredentialHeaders(headers: Headers): void {
+  for (const name of CROSS_ORIGIN_CREDENTIAL_HEADERS) headers.delete(name);
 }
 
 /** An origin is the combination of scheme, host, and port (default ports normalized). */
@@ -111,12 +129,9 @@ function isReplayableBody(body: BodyInit | null | undefined): boolean {
   return false;
 }
 
-function resolveUrl(input: RequestInfo | URL): URL | undefined {
+function resolveUrl(url: string): URL | undefined {
   try {
-    if (typeof input === "string") return new URL(input);
-    if (typeof URL !== "undefined" && input instanceof URL) return new URL(input.toString());
-    if (typeof Request !== "undefined" && input instanceof Request) return new URL(input.url);
-    return new URL(String(input));
+    return new URL(url);
   } catch {
     return undefined;
   }
@@ -152,33 +167,66 @@ export function createRedirectSafeFetch(
       return baseFetch(input, init);
     }
 
-    const inputIsRequest = typeof Request !== "undefined" && input instanceof Request;
-    const initialHeaders: HeadersInit | undefined =
-      init?.headers ?? (inputIsRequest ? (input as Request).headers : undefined);
+    const request =
+      typeof Request !== "undefined" && input instanceof Request ? input : undefined;
+    const initialHeaders: HeadersInit | undefined = init?.headers ?? request?.headers;
 
     // Fast path: nothing sensitive is at stake, keep default fetch behavior.
     if (!hasProtectedHeaders(new Headers(initialHeaders))) {
       return baseFetch(input, init);
     }
 
-    let method = (
-      init?.method ??
-      (inputIsRequest ? (input as Request).method : undefined) ??
-      "GET"
-    ).toUpperCase();
-    // A Request input hides its body behind a one-shot stream we cannot rewind.
-    const bodyFromRequest = inputIsRequest && (input as Request).body !== null;
-    let body: BodyInit | null | undefined = init?.body;
+    // Other init fields (e.g. the undici `dispatcher` or `duplex`) are carried
+    // onto every hop; per-hop fields are overridden below.
+    const baseInit: RequestInit = { ...(init ?? {}) };
+
+    let currentUrl: string;
+    let method: string;
+    let signal: AbortSignal | undefined;
+    let body: BodyInit | null | undefined;
+
+    if (request) {
+      currentUrl = request.url;
+      method = (init?.method ?? request.method ?? "GET").toUpperCase();
+      signal = init?.signal ?? request.signal ?? undefined;
+      if (init?.body !== undefined) {
+        body = init.body;
+      } else if (request.body !== null) {
+        // openapi-fetch sends Request objects. Buffer the body so 307/308 hops
+        // can replay it: a Request body stream can otherwise be consumed once.
+        try {
+          body = await request.arrayBuffer();
+        } catch {
+          // The body is already disturbed/unreadable; fall back to native.
+          return baseFetch(input, init);
+        }
+      }
+    } else {
+      currentUrl = typeof input === "string" ? input : input.toString();
+      method = (init?.method ?? "GET").toUpperCase();
+      signal = init?.signal ?? undefined;
+      body = init?.body;
+    }
 
     // Materialized lazily: until a redirect is actually followed the caller's
     // original header object is passed through unchanged.
     let headers: Headers | undefined;
+    let suppressClientIp = false;
 
-    let currentInput: RequestInfo | URL = input;
-    let currentInit: RequestInit = { ...(init ?? {}), redirect: "manual" };
+    let hopInit: RequestInit = request
+      ? {
+          ...baseInit,
+          method,
+          headers: initialHeaders,
+          body: body ?? undefined,
+          signal,
+          redirect: "manual",
+        }
+      : // Preserve the caller's original init shape on the first hop.
+        { ...baseInit, redirect: "manual" };
 
     for (let hop = 0; ; hop++) {
-      const response = await baseFetch(currentInput, currentInit);
+      const response = await baseFetch(currentUrl, hopInit);
 
       // Browsers expose `redirect: "manual"` as an opaque response (status 0,
       // empty headers), so the redirect target cannot be inspected. Fail closed
@@ -202,14 +250,14 @@ export function createRedirectSafeFetch(
         return response;
       }
 
-      const currentUrl = resolveUrl(currentInput);
-      if (!currentUrl) {
+      const currentUrlObj = resolveUrl(currentUrl);
+      if (!currentUrlObj) {
         return response;
       }
 
       let nextUrl: URL;
       try {
-        nextUrl = new URL(location, currentUrl);
+        nextUrl = new URL(location, currentUrlObj);
       } catch {
         return response;
       }
@@ -217,6 +265,9 @@ export function createRedirectSafeFetch(
       headers ??= new Headers(initialHeaders);
       if (!isSameOrigin(nextUrl, baseOrigin)) {
         stripProtectedHeaders(headers);
+        // Mirror native fetch/httpx: standard credentials do not cross origins.
+        stripCredentialHeaders(headers);
+        suppressClientIp = true;
       }
 
       // Mirror the Fetch redirect method/body semantics: 303 and POST 301/302
@@ -231,7 +282,7 @@ export function createRedirectSafeFetch(
         nextMethod = method === "HEAD" ? "HEAD" : "GET";
         nextBody = undefined;
       } else {
-        if (bodyFromRequest || (body != null && !isReplayableBody(body))) {
+        if (body != null && !isReplayableBody(body)) {
           // The body cannot be re-sent safely; surface the redirect instead of
           // replaying an unrewindable body to another origin.
           return response;
@@ -255,8 +306,18 @@ export function createRedirectSafeFetch(
 
       method = nextMethod;
       body = nextBody;
-      currentInput = nextUrl.toString();
-      currentInit = { ...currentInit, method, headers, body: nextBody ?? undefined };
+      currentUrl = nextUrl.toString();
+      hopInit = {
+        ...baseInit,
+        method,
+        headers,
+        body: nextBody ?? undefined,
+        signal,
+        redirect: "manual",
+      };
+      if (suppressClientIp) {
+        (hopInit as Record<PropertyKey, unknown>)[SUPPRESS_CLIENT_IP] = true;
+      }
     }
   };
 }

@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import { createExecdClient } from "@alibaba-group/opensandbox/internal";
+import {
+  createExecdClient,
+  createRedirectSafeFetch,
+} from "@alibaba-group/opensandbox/internal";
 import type { AdapterFactory, CreateCodesStackOptions } from "./adapterFactory.js";
 import { CodesAdapter } from "../adapters/codesAdapter.js";
 import type { Codes } from "../services/codes.js";
@@ -23,17 +26,27 @@ export class DefaultAdapterFactory implements AdapterFactory {
       ...(opts.sandbox.connectionConfig.headers ?? {}),
       ...(opts.endpointHeaders ?? {}),
     };
+    // Strip protected OpenSandbox headers before following a cross-origin
+    // redirect, matching the sandbox SDK (issue #2170).
+    const execdFetch = createRedirectSafeFetch(
+      opts.execdBaseUrl,
+      opts.sandbox.connectionConfig.fetch,
+    );
+    const execdSseFetch = createRedirectSafeFetch(
+      opts.execdBaseUrl,
+      opts.sandbox.connectionConfig.sseFetch,
+    );
     const client = createExecdClient({
       baseUrl: opts.execdBaseUrl,
       headers,
-      fetch: opts.sandbox.connectionConfig.fetch,
+      fetch: execdFetch,
     });
 
     return new CodesAdapter(client, {
       baseUrl: opts.execdBaseUrl,
       headers,
       // Streaming calls (SSE) use a dedicated fetch, aligned with Kotlin/Python SDKs.
-      fetch: opts.sandbox.connectionConfig.sseFetch,
+      fetch: execdSseFetch,
     });
   }
 }
