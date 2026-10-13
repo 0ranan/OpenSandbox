@@ -27,7 +27,7 @@ Egress is how a sandbox gets a network policy instead of open internet access. I
 
 **Layer 2 — Network (`dns+nft` mode).** nftables drops everything not explicitly allowed. Allowed traffic passes by static rule or by DNS-learned address sets: a resolved IP receives a bounded lease (with a grace window for active TCP connections), so "allowed" never silently becomes "allowed forever". UDP and QUIC flows rely on DNS lease timing alone.
 
-**Precedence.** First matching rule wins, in this order: platform `deny.always`, platform `allow.always`, then your policy — so the platform's deny always beats your allow. The overlays live in files inside the sidecar image and hot-reload every minute. A reload publishes the parsed pair only after the corresponding nftables static policy is accepted; parse or apply failures keep the active in-memory rules. Failures remain eligible for retry unless the experimental revision runtime requires recovery, as described below. Your policy is set per sandbox and can be mutated at runtime (add, replace, remove by target) through the API the SDKs expose.
+**Precedence.** First matching rule wins, in this order: platform `deny.always`, platform `allow.always`, then your policy — so the platform's deny always beats your allow. The overlays live in files inside the sidecar image and hot-reload every minute. A reload publishes the parsed pair only after the corresponding nftables static policy is accepted; the experimental revision runtime additionally requires exact receiver confirmation. Parse or apply failures keep the last accepted in-memory rules. Failures remain eligible for retry unless the experimental revision runtime requires recovery, as described below. Your policy is set per sandbox and can be mutated at runtime (add, replace, remove by target) through the API the SDKs expose.
 
 ## Design decisions
 
@@ -47,40 +47,68 @@ Layers 1 and 2 decide *whether* a connection may happen; the transparent MITM la
 
 Status: **experimental but production-usable**. The interception, credential-injection, and CA-delivery mechanism is complete and runs in production settings; what remains experimental is the configuration surface — extra ports and diagnostic switches may still change between releases.
 
-::: warning Internal OSEP-0023 bootstrap gate
+::: warning Internal OSEP-0023 revision runtime
 `OPENSANDBOX_EGRESS_EXPERIMENTAL_REVISION_RUNTIME=true` is a development-only,
-sidecar-profile gate for the OSEP-0023 revision protocol. Each mitmdump launch
-or restart receives a fresh authenticated process session and must acknowledge
-the current in-memory Vault snapshot (or the authoritative initial empty state)
-before health becomes ready. The default is off.
+sidecar-profile gate for the OSEP-0023 revision protocol. The default is off.
+Each mitmdump launch or child restart receives a fresh authenticated process
+session and must acknowledge the current in-memory Vault snapshot (or the
+authoritative initial empty state) with its committed Policy epoch before
+health becomes ready.
 
-The authenticated IPC backend jointly installs the immutable snapshot and its
-credential-free TLS selector view. Its connection and request admission remain
-disabled for the process lifetime, so install acknowledgements and active-revision
-readback confirm coherent state only. They do not report transport drain or
-completion of a public Vault mutation. Shutdown fences both views together.
+The live receiver jointly installs the immutable snapshot and its
+credential-free TLS selector view for connection and request admission. The
+internal sidecar experiment supports bound HTTPS/443 HTTP/1.1 traffic; it does
+not expose a supported public `interceptionMode` or enable Fast Sandbox or
+HTTP/2 support. See the [live admission boundary](/guides/credential-vault#experimental-live-credential-bound-admission-osep-0023).
 
-This gate does **not** enable credential-bound TLS selection. Existing traffic
-still uses intercept-all behavior and the conditional active-Vault lookup;
-connection fencing, Fast Sandbox, and the public `interceptionMode` contract are
-not wired to the revision protocol yet. To prevent the acknowledged bootstrap
-snapshot from diverging from the in-memory Vault, `POST`, `PATCH`, and `DELETE`
-on `/credential-vault` return `503` while this internal gate is enabled. An
-internal Go transaction owner now coordinates candidate installation and local
-Vault finalization, including fail-closed cleanup of the exact process generation
-on unresolved outcomes. It is not connected to these HTTP handlers and does not
-change the gate or provide transport-drain acknowledgement.
+Vault writes, existing `POST`/`PUT`/`PATCH`/`DELETE /policy` handlers and automatic
+always-rule reloads share the Policy/Vault mutation barrier and an exclusive
+live-session lease. Policy candidates validate all active bindings before any
+external effect and preserve the public Vault revision and already-rendered
+credentials. The Policy commit order is optional user-policy file persistence,
+nft application, exact receiver acknowledgement or reconciled readback, then
+Go proxy/base publication and API success. Reload skips user-policy persistence;
+the loader's accepted rules and metadata publish only after receiver confirmation.
+Failed reloads never rewrite operator-owned always files.
+
+These stages are not one atomic visibility boundary. In particular, nft rules
+can affect traffic before receiver acknowledgement. Once nft succeeded, even a
+definitive receiver rejection requires sticky recovery, quarantine and cleanup
+of the exact child/session. Reapplying the old nft policy is not proof that
+connections or requests created under the new rules were undone. A confirmed
+receiver update is finalized locally even if the HTTP request is then canceled;
+a lost API response does not roll back a committed update.
+
+Unavailable sessions, unconfirmed receiver outcomes and recovery-blocked writes
+return sanitized 503 responses. Existing initial file/nft failures may remain
+500; input validation stays 400 and the rule limit stays 413. A no-match DELETE
+or unchanged reload does not advance the internal Policy epoch, but cannot
+bypass recovery checks. Other committed writes may advance the epoch even when
+the content is equal. Later Vault mutations and bootstrap preserve that epoch.
+No epoch field, idempotency key or SDK method is added. `GET /policy` remains the
+last Go-published user policy, without always overlays, kernel state or an
+in-progress transaction indicator.
+
+Receiver acknowledgement covers publication and registration of old-request
+deadlines, not waiting for drain completion. The default is 30 seconds; later
+updates cannot extend the earliest old-request deadline. Expiry closes the
+whole tracked connection, potentially interrupting newer requests on it, while
+still-covered idle connections with no old requests remain usable. HTTP 101
+upgrades retain request admission and also drain on Policy-only changes. Actual
+closure follows the sweep and event loop, with failed closes retried. This does
+not promise termination of opaque or direct-IP established connections.
 
 The experimental lifecycle also keeps an authoritative policy base and a
 private bootstrap ticket under the shared policy/Vault barrier. Initial startup
-and automatic child restart use the same final check: the captured policy base,
+and the revision layer's child-restart path use the same final check: the captured policy base,
 Store and Vault mutation identity must still be current, the exact child/session
 must still belong to the pending attempt, and recovery must not be required.
 Snapshot installation or listener availability alone cannot make health ready.
 Policy or always-rule publication, including replacement with identical rules,
 and Vault changes invalidate an older capture. A rejected attempt stops and reaps
-only its own child before closing its session; a clean restart can capture fresh
-state and recover. Initial startup also retries a stale publication with a fresh
+only its own child before closing its session. A rejected launch can capture
+fresh state only while recovery has not been required. Initial startup also
+retries a stale publication with a fresh
 capture, up to three total launch attempts, so an immediate always-rule reload
 can settle without forcing the sidecar to exit. Redirect and CA preparation run
 once. Other startup errors, cancellation, shutdown, and recovery-required state
@@ -90,8 +118,9 @@ If experimental policy processing attempts a policy-file or nft update and then
 fails with an uncertain outcome, or session cleanup cannot be confirmed, the Go
 owner latches `recovery-required`. Health stays not-ready, and internal candidate
 preparation, Vault mutation ownership and new bootstrap publication are blocked.
-Parsing or validation errors before external effects, and ordinary clean child
-crashes, do not set this latch. Shutdown and teardown remain available. The first
+Parsing or validation errors before external effects do not themselves set this
+latch. Shutdown and teardown remain available subject to the fault-containment
+boundary below. The first
 recovery reason remains sticky for that Go process incarnation; successful
 readback, listener checks and ordinary child restarts cannot clear it. There is
 no reset API in this increment.
@@ -160,7 +189,7 @@ not clear recovery. Temporary files are cleaned up on ordinary error returns;
 a process crash may leave a temporary file for operator inspection.
 
 This protocol does not make policy files and nft state one crash-consistent
-transaction. It provides no durable recovery journal, kernel rollback or packet
+transaction. The policy-file primitive provides no durable recovery journal, kernel rollback or packet
 fence. Existing open file descriptors continue to see the previous inode; readers
 must reopen the policy path to observe replacements. Default deployments with the
 experimental gate off, including DNS-only mode, retain legacy in-place persistence.
@@ -213,11 +242,12 @@ Stopping lease renewal can reduce workload availability; DNS-learned upstream
 proxy addresses can expire and cause later proxy connections to fail. Existing
 connections are not necessarily disconnected by the freeze.
 
-There is no unfreeze operation. Explicit shutdown `RemoveEnforcement` can still
-delete the nft table, whether cleanup succeeds or fails, and never clears the
-Manager's frozen state. This does not provide a packet fence: existing rules,
-leased addresses and established connections may still allow traffic, and
-teardown may remove enforcement. The freeze does not survive process restart,
+There is no unfreeze operation. The Manager API `RemoveEnforcement` can still
+delete the nft table without clearing the Manager's frozen state. Legacy
+shutdown uses that API; the experimental runtime owner retains enforcement at
+shutdown as described below. The Manager freeze alone does not provide a packet
+fence: existing rules, leased addresses and established connections may still
+allow traffic. The freeze does not survive process restart,
 roll back unknown external effects, or add a hard shutdown deadline. Legacy
 sidecar and Fast Sandbox behavior are unchanged; dns-only recovery keeps its
 existing readiness behavior without requiring an nft Manager.
@@ -242,9 +272,62 @@ does not establish kernel behavior or packet isolation.
 This state is in memory only. Readiness is not a network-traffic fence, and this
 increment provides no atomic policy-file/nft rollback, dynamic DNS-state recovery
 or whole-process crash durability. Restarting the entire sidecar loses the latch
-and is not a verified safe recovery procedure. Active policy epochs remain zero;
-legacy policy success responses are not revision transaction acknowledgements.
+and is not a verified safe recovery procedure. Internal Policy epochs advance
+only on committed Policy revisions and are retained by Vault writes and
+bootstrap. With the gate off, legacy policy success responses retain their
+existing meaning.
 :::
+
+### Experimental runtime fault containment
+
+A separate fault-containment owner supplements the process-local recovery latch
+and nft Manager freeze described above. For the Linux `dns+nft` sidecar, it uses the existing experimental
+revision-runtime gate and adds no lifecycle-server wiring, deployment topology
+or configuration surface. Normal policy, always-rule and internal Vault updates
+do not install a whole-IP fence. The independent fence is attempted through the
+recovery-required path, including an unknown external effect. A known
+`prepareRejected` or definitive `committed=false` result does not by itself add
+permanent isolation when no local effect requires recovery. A Policy update
+that has already committed nft rules requires recovery and quarantine even
+with that definitive receiver rejection. Successful operations retain their
+existing behavior unless recovery was already required.
+
+An unexpected child death enters recovery only when the observation still
+matches the exact currently owned, running child generation. Stale, already
+detached or normally stopping generations do not trigger a new fence. Normal
+shutdown likewise does not add a fence. In this experimental path, shutdown
+stops services but retains existing policy and redirect rules, even before a
+fault, so a late failure during drain or session cleanup cannot be followed by
+enforcement removal. Legacy shutdown cleanup is unchanged.
+
+Containment targets the original network namespace pinned for the current Go
+process's lifetime. `QuarantineConfirmed` requires confirmation of that target
+and exact kernel readback of the independent `inet opensandbox_quarantine`
+table. Failure to validate the target, install the fence or confirm its readback
+leaves packet isolation `QuarantineUnknown`. Readiness, writer quiescence and
+packet isolation remain separate facts: a 503 response or process exit does not
+prove that traffic has stopped.
+
+When confirmed in that target, the fence drops IPv4 and IPv6 at input, output
+and forward hooks, including loopback, established and new connections, UDP,
+marked traffic, the MITM UID, DNS and upstream-proxy exceptions. This also
+interrupts health/control HTTP and execd IP connections. The boundary assumes
+no workload NET_ADMIN/NET_RAW, hostile privileged namespace writer, or L2 or
+offloaded bypass of the supported inet path. Detection is not instantaneous;
+there is no zero-leakage guarantee before detection and fence confirmation.
+An installation failure reports unknown isolation and does not guarantee that
+the workload is killed or otherwise stopped.
+
+Ordinary policy-table and redirect cleanup do not delete this independent
+fence. After a runtime fault, the owner does not automatically remove it or
+restore service. A table left in the kernel is not a complete restart protocol.
+The namespace pin lasts only for this Go process: this increment makes no
+containment or recovery guarantee across Go-process or container restart and
+provides no durable intent, replay, pause/resume recovery or safe automatic
+restart. Legacy prestart may remove ordinary redirects while leaving a residual
+fence, so a restart can fail to become ready; destroy and recreate the sandbox
+instead of treating restart as verified recovery. Durable lifecycle
+ownership and recovery remain separate future work.
 
 **Trust is delivered, not disabled.** The sidecar exports its CA, and the sandbox bootstrap installs it into the system, NSS, and JDK trust stores on a best-effort basis — clients keep certificate verification on (`curl` without `-k`), and traffic stays encrypted end-to-end from the sandbox's point of view. Images that run Chromium-family browsers should ship the native `certutil` package so the per-user NSS store can be updated.
 
@@ -289,7 +372,7 @@ Both layers rewrite outbound traffic in the same namespace, so per-sandbox polic
 
 ## Shutdown
 
-On shutdown, the sidecar keeps DNS and network rules working while in-flight deliveries finish (a bounded window), then removes its network rules and flushes telemetry. Delivery is best effort — forced termination can drop events. Under Docker, deletion gives the sidecar a 9-second stop budget before forced termination. A lightweight supervisor restarts the sidecar on crash with exponential backoff and a crash-loop breaker, and cleans stale redirect state before a fresh start.
+On shutdown, the sidecar keeps DNS and network rules working while in-flight deliveries finish (a bounded window), then removes its network rules and flushes telemetry in the legacy path. The experimental runtime-containment owner instead retains ordinary policy/redirect rules at shutdown, without adding a normal-shutdown fence. Delivery is best effort — forced termination can drop events. Under Docker, deletion gives the sidecar a 9-second stop budget before forced termination. A lightweight supervisor restarts the sidecar on crash with exponential backoff and a crash-loop breaker, and cleans stale redirect state before a fresh start.
 
 ## Observability (OpenTelemetry)
 

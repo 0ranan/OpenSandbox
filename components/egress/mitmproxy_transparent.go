@@ -210,12 +210,28 @@ func waitMitmRetry(ctx context.Context, shutdown <-chan struct{}, delay time.Dur
 
 func (m *mitmTransparent) recordExit(gen uint64) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	var failedOwner *policyServer
 	if m.launchGen == gen {
 		m.launchExited = true
 	}
 	if m.currentGen == gen && m.revisionOwner != nil && m.revisionOwner.server != nil {
 		m.revisionOwner.server.mitmGate.SetReady(false)
+		if !m.stopping && m.running != nil && m.revisionOwner.server.quarantine != nil {
+			failedOwner = m.revisionOwner.server
+		}
+	}
+	m.mu.Unlock()
+	// Preserve s.mu -> m.mu lock order. The sticky recovery latch invalidates
+	// bootstrap tickets before any retry can publish readiness.
+	if failedOwner != nil {
+		failedOwner.mu.Lock()
+		m.mu.Lock()
+		stillOwned := !m.stopping && m.running != nil && m.currentGen == gen && m.revisionOwner != nil && m.revisionOwner.server == failedOwner
+		m.mu.Unlock()
+		if stillOwned {
+			failedOwner.requireRevisionRecoveryLocked(revisionRecoveryUnknown)
+		}
+		failedOwner.mu.Unlock()
 	}
 }
 

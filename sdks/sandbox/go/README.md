@@ -594,6 +594,10 @@ Return a non-nil error from the handler to stop processing the stream early.
 
 ## Client Options
 
+Cross-origin redirects strip protected OpenSandbox headers, including for file
+transfers and SSE. See [redirect behavior](../../../docs/sdks/go.md#follow-redirects)
+for details and custom HTTP client behavior.
+
 All client constructors accept optional `Option` functions:
 
 ```go

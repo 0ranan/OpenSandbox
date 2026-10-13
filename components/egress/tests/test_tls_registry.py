@@ -1417,6 +1417,51 @@ class TLSRetirementDeadlineTest(unittest.TestCase):
                 self.assertEqual(registry._connection_deadlines, {})
                 self.assertEqual(registry.acquire_request(token).action, "allow")
 
+    def test_policy_only_idle_connection_and_completed_request_do_not_expire(self):
+        registry, active = self.setup_registry()
+        token = self.admit(registry).token
+        old = registry.acquire_request(token)
+        target, uncovered = self.rotate(
+            registry, active, policy_epoch=2, vault_revision=1, secret="private-old-value",
+        )
+        self.assertEqual(uncovered, ())
+        self.assertEqual(registry._connection_deadlines, {})
+        new = registry.acquire_request(token)
+        self.assertEqual(new.snapshot.revision, target.revision)
+        self.assertEqual(old.snapshot.revision.vault_revision, new.snapshot.revision.vault_revision)
+        self.assertEqual(old.snapshot.revision.policy_epoch, 1)
+        self.assertEqual(new.snapshot.revision.policy_epoch, 2)
+        self.assertIn(b"private-old-value", new.snapshot.payload)
+        self.assertTrue(registry.finish_request(old.handle))
+        self.clock.return_value = 150.0
+        self.assertEqual(registry.expired_connections(), ())
+        self.assertTrue(registry.finish_request(new.handle))
+        self.rotate(registry, active, epoch=3, policy_epoch=3, vault_revision=1, secret="private-old-value")
+        self.clock.return_value = 1000.0
+        self.assertEqual(registry.expired_connections(), ())
+        self.assertEqual(registry.acquire_request(token).action, "allow")
+
+    def test_policy_only_earliest_request_deadline_closes_entire_connection(self):
+        registry, active = self.setup_registry()
+        token = self.admit(registry).token
+        old = registry.acquire_request(token)
+        self.rotate(registry, active, policy_epoch=2, vault_revision=1, secret="private-old-value")
+        middle = registry.acquire_request(token)
+        self.clock.return_value = 120.0
+        self.rotate(registry, active, epoch=3, policy_epoch=3, vault_revision=1, secret="private-old-value")
+        newest = registry.acquire_request(token)
+        self.assertEqual(registry._request_deadlines, {
+            old.handle.serial: 130.0, middle.handle.serial: 150.0,
+        })
+        self.clock.return_value = 130.0
+        self.assertEqual(registry.expired_connections(), (token,))
+        # The existing transport owner closes the entire connection, including
+        # a new request pinned after the latest policy cutover.
+        self.assertTrue(registry.release(token))
+        self.assertEqual(registry.request_count, 0)
+        for request in (old, middle, newest):
+            self.assertFalse(registry.finish_request(request.handle))
+
     def test_repeated_rotations_keep_first_deadline_and_deduplicate_connections(self):
         registry, active = self.setup_registry(request_capacity=8)
         first, second = [self.admit(registry).token for _ in range(2)]

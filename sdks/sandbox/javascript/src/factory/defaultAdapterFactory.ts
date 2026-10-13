@@ -131,6 +131,13 @@ export class DefaultAdapterFactory implements AdapterFactory {
       opts.execdBaseUrl,
       undefined,
     );
+    // Uploads use a dedicated transport without an overall timeout; uploads
+    // never follow redirects, so no chain deadline applies.
+    const execdUploadFetch = withRedirectGuard(
+      opts.connectionConfig.uploadFetch,
+      opts.execdBaseUrl,
+      undefined,
+    );
     const execdClient = createExecdClient({
       baseUrl: opts.execdBaseUrl,
       headers,
@@ -142,6 +149,7 @@ export class DefaultAdapterFactory implements AdapterFactory {
     const files = new FilesystemAdapter(execdClient, {
       baseUrl: opts.execdBaseUrl,
       fetch: execdFetch,
+      uploadFetch: execdUploadFetch,
       headers,
     });
     const commands = new CommandsAdapter(execdClient, {
@@ -154,6 +162,7 @@ export class DefaultAdapterFactory implements AdapterFactory {
       baseUrl: opts.execdBaseUrl,
       fetch: execdFetch,
       sseFetch: execdSseFetch,
+      uploadFetch: execdUploadFetch,
       headers,
     });
 

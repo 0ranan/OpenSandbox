@@ -112,11 +112,18 @@ export interface IsolatedFilesystemAdapterOptions {
   baseUrl: string;
   sessionId: string;
   fetch?: typeof fetch;
+  /**
+   * No-overall-timeout fetch used for uploads, whose request body is produced
+   * by the caller and may take longer than the connection's request timeout.
+   * See `ConnectionConfig.uploadFetch`. Falls back to `fetch`.
+   */
+  uploadFetch?: typeof fetch;
   headers?: Record<string, string>;
 }
 
 export class IsolatedFilesystemAdapter implements SandboxFiles {
   private readonly fetch: typeof fetch;
+  private readonly uploadFetch: typeof fetch;
   private readonly sessionId: string;
 
   private static readonly Api = {
@@ -133,6 +140,7 @@ export class IsolatedFilesystemAdapter implements SandboxFiles {
     private readonly opts: IsolatedFilesystemAdapterOptions,
   ) {
     this.fetch = opts.fetch ?? fetch;
+    this.uploadFetch = opts.uploadFetch ?? this.fetch;
     this.sessionId = opts.sessionId;
   }
 
@@ -339,7 +347,7 @@ export class IsolatedFilesystemAdapter implements SandboxFiles {
       form.append("file", fileBlob, fileName);
     }
 
-    const res = await this.fetch(url, {
+    const res = await this.uploadFetch(url, {
       method: "POST",
       headers: { ...(this.opts.headers ?? {}) },
       body: form,

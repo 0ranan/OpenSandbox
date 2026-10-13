@@ -140,6 +140,9 @@ func (p *Proxy) handle(sw *statusCapturingResponseWriter, r *http.Request) {
 		if errors.As(err, &detailed) {
 			Logger.With(slogger.Field{Key: "error", Value: detailed.InternalCause()}).Errorf("ingress: provider resolution failed")
 		}
+		if respondWakeTimeout(sw, err) {
+			return
+		}
 		if status == 0 {
 			status = http.StatusBadRequest
 		}
@@ -150,9 +153,10 @@ func (p *Proxy) handle(sw *statusCapturingResponseWriter, r *http.Request) {
 		return
 	}
 
-	// OSEP-0024: every routed request feeds the sandbox idle clock, including
-	// requests that skip renewal. Fire-and-forget; failures are dropped.
-	if p.activity != nil {
+	// OSEP-0024: every routed request feeds the sandbox idle clock, renewal
+	// skip included. The activity-probe sentinel is the one opt-out.
+	// Fire-and-forget; failures are dropped.
+	if p.activity != nil && !IsSkipActivity(r.Header) {
 		p.activity.Record(host.namespace, host.ingressKey)
 	}
 
@@ -252,6 +256,7 @@ func (p *Proxy) applyUpstreamRequest(r *http.Request, host *sandboxHost, targetU
 	r.Header.Del(SandboxIngress)
 	r.Header.Del(DeprecatedSandboxIngress)
 	r.Header.Del(AccessRenew)
+	r.Header.Del(SkipActivity)
 	r.Header.Del(signature.OpenSandboxSecureAccessCanonical)
 	r.Header.Del(sandbox.FastSandboxCredential)
 	// Host is carried by r.Host, not r.Header. The Phase 1a Fast Sandbox provider
@@ -296,7 +301,7 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, target sandbox.End
 				r.URL.Scheme = httpScheme
 			}
 		}
-		httpProxy := NewHTTPProxy(append(extraResponseObservers, p.upstreamResponseObserver(target))...) //nolint:bodyclose // httputil.ReverseProxy owns response bodies.
+		httpProxy := NewHTTPProxy(append([]func(*http.Response){stripWakeMarkerObserver()}, append(extraResponseObservers, p.upstreamResponseObserver(target))...)...) //nolint:bodyclose // httputil.ReverseProxy owns response bodies.
 		httpProxy.errorObserver = p.upstreamErrorObserver(target)
 		httpProxy.transport = p.httpTransport
 		httpProxy.ServeHTTP(w, r)

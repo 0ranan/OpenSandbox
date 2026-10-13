@@ -24,6 +24,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptrace"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
 )
@@ -208,14 +210,15 @@ func NewClient(baseURL, apiKey, authHeader string, opts ...Option) *Client {
 			Timeout:   defaultTimeout,
 			Transport: DefaultTransport(),
 		}
-	} else if c.httpClient.Transport == nil {
-		// Clone the caller's client to avoid mutating shared instances
-		// (e.g. http.DefaultClient) which would leak the SDK's transport
-		// settings into unrelated traffic in the same process.
-		cloned := *c.httpClient
-		cloned.Transport = DefaultTransport()
-		c.httpClient = &cloned
 	}
+	// Keep SDK redirect and timeout settings local, even when the caller's
+	// client already has a transport and is shared with unrelated traffic.
+	cloned := *c.httpClient
+	c.httpClient = &cloned
+	if c.httpClient.Transport == nil {
+		c.httpClient.Transport = DefaultTransport()
+	}
+	c.httpClient.CheckRedirect = protectedHeaderRedirectPolicy(c.httpClient.CheckRedirect, authHeader, c.authHeader)
 	// Apply deferred timeout after all options so it works regardless of
 	// WithHTTPClient ordering and guards against a nil httpClient.
 	if c.timeout != nil {
@@ -226,6 +229,53 @@ func NewClient(baseURL, apiKey, authHeader string, opts ...Option) *Client {
 	// and is skipped silently when the IP cannot be determined.
 	c.headers = applyClientIP(c.headers, detectedClientIP())
 	return c
+}
+
+// redirectOrigin normalizes the URL components that define an HTTP origin.
+func redirectOrigin(u *url.URL) [3]string {
+	scheme := strings.ToLower(u.Scheme)
+	port := u.Port()
+	if port == "" {
+		switch scheme {
+		case "http":
+			port = "80"
+		case "https":
+			port = "443"
+		}
+	}
+	return [3]string{scheme, strings.ToLower(u.Hostname()), port}
+}
+
+func protectedHeaderRedirectPolicy(policy func(*http.Request, []*http.Request) error, authHeaders ...string) func(*http.Request, []*http.Request) error {
+	protectedAuthHeaders := make(map[string]bool, len(authHeaders))
+	for _, name := range authHeaders {
+		if name != "" {
+			protectedAuthHeaders[strings.ToUpper(name)] = true
+		}
+	}
+	return func(req *http.Request, via []*http.Request) error {
+		// Save the initial origin before a caller callback can change requests.
+		origin := redirectOrigin(via[0].URL)
+		if policy != nil {
+			if err := policy(req, via); err != nil {
+				return err
+			}
+		} else if len(via) >= 10 {
+			// Match net/http's default policy when no custom policy was supplied.
+			return errors.New("stopped after 10 redirects")
+		}
+		if redirectOrigin(req.URL) != origin {
+			// net/http copies the initial request's headers on every hop. Check
+			// each destination, including later hops on the foreign origin.
+			for name := range req.Header {
+				upper := strings.ToUpper(name)
+				if protectedAuthHeaders[upper] || strings.HasPrefix(upper, "OPEN-SANDBOX-") || strings.HasPrefix(upper, "OPENSANDBOX-") {
+					delete(req.Header, name)
+				}
+			}
+		}
+		return nil
+	}
 }
 
 // doRequest executes an HTTP request with JSON encoding and auth headers,

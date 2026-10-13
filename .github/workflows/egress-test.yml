@@ -22,7 +22,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.relevant == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -60,9 +60,9 @@ jobs:
         run: |
           go test ./...
 
-      - name: Test privileged Go test runner
+      - name: Test privileged regression runners
         working-directory: components/egress
-        run: python -m unittest discover -v -s scripts -p "test_ci_privileged_go_test.py"
+        run: python -m unittest discover -v -s scripts -p "test_*.py"
 
       - name: Run privileged atomic policy mount regressions
         working-directory: components/egress
@@ -87,7 +87,7 @@ jobs:
         working-directory: components/egress
         run: |
           sudo apt-get update
-          sudo apt-get install -y nftables
+          sudo apt-get install -y nftables iproute2 util-linux
           bash scripts/ci-nft-go-test.sh ./pkg/nftables \
             TestDynamicElementRenewal \
             TestNftQuiescenceAfterCommittedStaticError \
@@ -95,6 +95,45 @@ jobs:
             TestNftRealMissingTableFallback
           bash scripts/ci-nft-go-test.sh . \
             TestRevisionNftEffectsRealFileAndKernel
+
+      - name: Run privileged quarantine packet regressions
+        working-directory: components/egress
+        run: |
+          bash scripts/ci-nft-go-test.sh ./pkg/quarantine \
+            TestQuarantineFenceKernelTraffic \
+            TestQuarantineFenceKernelFaults
+
+      - name: Run real runtime recovery quarantine image regression
+        run: |
+          docker build -f components/egress/Dockerfile \
+            -t opensandbox-egress:quarantine-ci .
+          python components/egress/scripts/test_quarantine_image.py \
+            --image opensandbox-egress:quarantine-ci --artifacts /tmp/quarantine-image-evidence
+
+      - name: Upload quarantine image evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: quarantine-image-evidence
+          path: /tmp/quarantine-image-evidence
+          if-no-files-found: ignore
+          retention-days: 5
+
+      - name: Run live vault binding image regression
+        run: |
+          docker build -f components/egress/Dockerfile \
+            -t opensandbox-egress:live-vault-ci .
+          python components/egress/scripts/test_live_vault_image.py \
+            --image opensandbox-egress:live-vault-ci --artifacts /tmp/live-vault-image-evidence
+
+      - name: Upload live vault image evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: live-vault-image-evidence
+          path: /tmp/live-vault-image-evidence
+          if-no-files-found: ignore
+          retention-days: 5
 
       - name: Run mitmscripts unit and runtime tests
         working-directory: components/egress
