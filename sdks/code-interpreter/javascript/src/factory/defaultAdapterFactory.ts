@@ -12,13 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import {
-  createExecdClient,
-  createRedirectSafeFetch,
-} from "@alibaba-group/opensandbox/internal";
+import { createExecdClient } from "@alibaba-group/opensandbox/internal";
 import type { AdapterFactory, CreateCodesStackOptions } from "./adapterFactory.js";
 import { CodesAdapter } from "../adapters/codesAdapter.js";
 import type { Codes } from "../services/codes.js";
+import {
+  createRedirectSafeExecdFetch,
+  createRedirectSafeExecdSseFetch,
+} from "../transport.js";
 
 export class DefaultAdapterFactory implements AdapterFactory {
   createCodes(opts: CreateCodesStackOptions): Codes {
@@ -28,14 +29,8 @@ export class DefaultAdapterFactory implements AdapterFactory {
     };
     // Strip protected OpenSandbox headers before following a cross-origin
     // redirect, matching the sandbox SDK (issue #2170).
-    const execdFetch = createRedirectSafeFetch(
-      opts.execdBaseUrl,
-      opts.sandbox.connectionConfig.fetch,
-    );
-    const execdSseFetch = createRedirectSafeFetch(
-      opts.execdBaseUrl,
-      opts.sandbox.connectionConfig.sseFetch,
-    );
+    const execdFetch = createRedirectSafeExecdFetch(opts.sandbox, opts.execdBaseUrl);
+    const execdSseFetch = createRedirectSafeExecdSseFetch(opts.sandbox, opts.execdBaseUrl);
     const client = createExecdClient({
       baseUrl: opts.execdBaseUrl,
       headers,

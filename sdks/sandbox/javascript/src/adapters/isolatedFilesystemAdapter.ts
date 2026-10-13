@@ -41,6 +41,7 @@ import type {
 } from "../models/filesystem.js";
 import { SandboxApiException, SandboxError } from "../core/exceptions.js";
 import { iterateBodyStream } from "../core/streams.js";
+import { throwOnUploadFailure } from "./uploadFailure.js";
 
 function joinUrl(baseUrl: string, pathname: string): string {
   const base = baseUrl.endsWith("/") ? baseUrl.slice(0, -1) : baseUrl;
@@ -348,17 +349,7 @@ export class IsolatedFilesystemAdapter implements SandboxFiles {
       redirect: "manual",
     });
 
-    if (!res.ok) {
-      const requestId = res.headers.get("x-request-id") ?? undefined;
-      const rawBody = await res.text().catch(() => undefined);
-      throw new SandboxApiException({
-        message: `Upload failed (status=${res.status})`,
-        statusCode: res.status,
-        requestId,
-        error: new SandboxError(SandboxError.UNEXPECTED_RESPONSE, "Upload failed"),
-        rawBody,
-      });
-    }
+    await throwOnUploadFailure(res);
   }
 
   async readBytes(

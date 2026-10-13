@@ -1,11 +1,11 @@
 // Copyright 2026 The OpenSandbox Authors
-// 
+//
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
-// 
+//
 //     http://www.apache.org/licenses/LICENSE-2.0
-// 
+//
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -16,6 +16,7 @@ import { createExecdClient } from "../openapi/execdClient.js";
 import { createEgressClient } from "../openapi/egressClient.js";
 import { createLifecycleClient } from "../openapi/lifecycleClient.js";
 import { createRedirectSafeFetch } from "../config/redirectFetch.js";
+import type { ConnectionConfig } from "../config/connection.js";
 
 import { CommandsAdapter } from "../adapters/commandsAdapter.js";
 import { EgressAdapter } from "../adapters/egressAdapter.js";
@@ -72,17 +73,39 @@ function createDataPlaneHeaders(
   return headers;
 }
 
+/**
+ * Wrap a transport so protected headers are stripped on cross-origin redirects.
+ * `overallTimeoutMs` is applied only to request/response transports (SSE streams
+ * pass `undefined` so a long-lived stream is not aborted).
+ */
+function withRedirectGuard(
+  baseFetch: typeof fetch,
+  baseUrl: string,
+  overallTimeoutSeconds: number | undefined,
+): typeof fetch {
+  return createRedirectSafeFetch(baseUrl, baseFetch, {
+    overallTimeoutMs:
+      overallTimeoutSeconds && overallTimeoutSeconds > 0
+        ? overallTimeoutSeconds * 1000
+        : undefined,
+  });
+}
+
 export class DefaultAdapterFactory implements AdapterFactory {
-  createLifecycleStack(opts: CreateLifecycleStackOptions): LifecycleStack {
-    const lifecycleClient = createLifecycleClient({
-      baseUrl: opts.lifecycleBaseUrl,
-      apiKey: opts.connectionConfig.apiKey,
-      headers: opts.connectionConfig.headers,
-      fetch: createRedirectSafeFetch(
-        opts.lifecycleBaseUrl,
-        opts.connectionConfig.fetch,
-      ),
+  private buildLifecycleClient(config: ConnectionConfig, baseUrl: string) {
+    return createLifecycleClient({
+      baseUrl,
+      apiKey: config.apiKey,
+      headers: config.headers,
+      fetch: withRedirectGuard(config.fetch, baseUrl, config.requestTimeoutSeconds),
     });
+  }
+
+  createLifecycleStack(opts: CreateLifecycleStackOptions): LifecycleStack {
+    const lifecycleClient = this.buildLifecycleClient(
+      opts.connectionConfig,
+      opts.lifecycleBaseUrl,
+    );
     const sandboxes = new SandboxesAdapter(lifecycleClient, {
       ttlMs: opts.connectionConfig.endpointCacheTtlMs,
       maxSize: opts.connectionConfig.endpointCacheSize,
@@ -98,13 +121,15 @@ export class DefaultAdapterFactory implements AdapterFactory {
       opts.connectionConfig.useServerProxy,
       opts.connectionConfig.apiKey,
     );
-    const execdFetch = createRedirectSafeFetch(
-      opts.execdBaseUrl,
+    const execdFetch = withRedirectGuard(
       opts.connectionConfig.fetch,
-    );
-    const execdSseFetch = createRedirectSafeFetch(
       opts.execdBaseUrl,
+      opts.connectionConfig.requestTimeoutSeconds,
+    );
+    const execdSseFetch = withRedirectGuard(
       opts.connectionConfig.sseFetch,
+      opts.execdBaseUrl,
+      undefined,
     );
     const execdClient = createExecdClient({
       baseUrl: opts.execdBaseUrl,
@@ -148,9 +173,10 @@ export class DefaultAdapterFactory implements AdapterFactory {
       opts.connectionConfig.useServerProxy,
       opts.connectionConfig.apiKey,
     );
-    const egressFetch = createRedirectSafeFetch(
-      opts.egressBaseUrl,
+    const egressFetch = withRedirectGuard(
       opts.connectionConfig.fetch,
+      opts.egressBaseUrl,
+      opts.connectionConfig.requestTimeoutSeconds,
     );
     const egressClient = createEgressClient({
       baseUrl: opts.egressBaseUrl,
@@ -169,15 +195,10 @@ export class DefaultAdapterFactory implements AdapterFactory {
   }
 
   createNetworkPolicyStack(opts: CreateNetworkPolicyStackOptions): EgressStack {
-    const lifecycleClient = createLifecycleClient({
-      baseUrl: opts.lifecycleBaseUrl,
-      apiKey: opts.connectionConfig.apiKey,
-      headers: opts.connectionConfig.headers,
-      fetch: createRedirectSafeFetch(
-        opts.lifecycleBaseUrl,
-        opts.connectionConfig.fetch,
-      ),
-    });
+    const lifecycleClient = this.buildLifecycleClient(
+      opts.connectionConfig,
+      opts.lifecycleBaseUrl,
+    );
     return {
       egress: new NetworkPolicyAdapter(lifecycleClient, opts.sandboxId),
     };

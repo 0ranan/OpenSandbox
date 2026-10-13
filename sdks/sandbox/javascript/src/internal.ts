@@ -44,6 +44,7 @@ export { MetricsAdapter } from "./adapters/metricsAdapter.js";
 export { FilesystemAdapter } from "./adapters/filesystemAdapter.js";
 export { CommandsAdapter } from "./adapters/commandsAdapter.js";
 export { IsolatedSessionsAdapter } from "./adapters/isolatedSessionsAdapter.js";
+export { IsolatedFilesystemAdapter } from "./adapters/isolatedFilesystemAdapter.js";
 export { EndpointCache } from "./core/endpointCache.js";
 
 // Cross-origin redirect protection helpers (advanced/testing).

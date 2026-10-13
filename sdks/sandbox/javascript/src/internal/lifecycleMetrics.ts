@@ -79,7 +79,8 @@ export function reportSandboxCreateMetric(
       payload.image = opts.image;
     }
 
-    const url = `${connectionConfig.getBaseUrl().replace(/\/$/, "")}/metrics/events`;
+    const baseUrl = connectionConfig.getBaseUrl();
+    const url = `${baseUrl.replace(/\/$/, "")}/metrics/events`;
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
       ...(connectionConfig.headers ?? {}),
@@ -100,10 +101,9 @@ export function reportSandboxCreateMetric(
 
     // Report through the redirect-safe transport so the API key is never
     // replayed if the lifecycle endpoint redirects cross-origin.
-    const fetchImpl = createRedirectSafeFetch(
-      connectionConfig.getBaseUrl(),
-      connectionConfig.fetch,
-    );
+    const fetchImpl = createRedirectSafeFetch(baseUrl, connectionConfig.fetch, {
+      overallTimeoutMs: connectionConfig.requestTimeoutSeconds * 1000,
+    });
     void fetchImpl(url, {
       method: "POST",
       headers,

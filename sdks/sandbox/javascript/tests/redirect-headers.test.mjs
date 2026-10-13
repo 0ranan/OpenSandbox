@@ -23,6 +23,7 @@ import {
 } from "../dist/index.js";
 import {
   FilesystemAdapter,
+  IsolatedFilesystemAdapter,
   createExecdClient,
   createRedirectSafeFetch,
   hasProtectedHeaders,
@@ -216,6 +217,74 @@ test("the request signal is carried across redirected hops", async () => {
   assert.equal(signals[1].aborted, true);
 });
 
+test("303 and POST 301/302 convert to GET and drop entity headers", async () => {
+  const calls = [];
+  const baseFetch = async (input, init) => {
+    const request = new Request(input, init);
+    calls.push({
+      method: request.method,
+      headers: Object.fromEntries(request.headers),
+      body: await request.text(),
+    });
+    if (calls.length === 1) {
+      return new Response(null, { status: 303, headers: { location: "http://other.test/final" } });
+    }
+    return new Response("ok", { status: 200 });
+  };
+  const safeFetch = createRedirectSafeFetch("http://a.test", baseFetch);
+
+  const request = new Request("http://a.test/start", {
+    method: "POST",
+    headers: { "content-type": "application/json", "OPEN-SANDBOX-API-KEY": "tenant-secret" },
+    body: JSON.stringify({ a: 1 }),
+  });
+
+  const res = await safeFetch(request);
+  assert.equal(res.status, 200);
+  assert.equal(calls[1].method, "GET");
+  assert.equal(calls[1].body, "");
+  assert.equal(calls[1].headers["content-type"], undefined);
+});
+
+test("a Request carrying redirect: manual is not followed", async () => {
+  const calls = [];
+  const baseFetch = async (input, init) => {
+    const request = new Request(input, init);
+    calls.push(request.url);
+    return new Response(null, { status: 302, headers: { location: "http://other.test/final" } });
+  };
+  const safeFetch = createRedirectSafeFetch("http://a.test", baseFetch);
+
+  const request = new Request("http://a.test/start", {
+    method: "GET",
+    headers: { "OPEN-SANDBOX-API-KEY": "tenant-secret" },
+    redirect: "manual",
+  });
+
+  const res = await safeFetch(request);
+  assert.equal(res.status, 302);
+  // Only the original request was issued; the redirect was not chased.
+  assert.equal(calls.length, 1);
+});
+
+test("non-HTTP(S) Location values are surfaced, not followed", async () => {
+  const calls = [];
+  const baseFetch = async (input, init) => {
+    calls.push(new Request(input, init).url);
+    return new Response(null, {
+      status: 302,
+      headers: { location: "data:application/json,%7B%7D" },
+    });
+  };
+  const safeFetch = createRedirectSafeFetch("http://a.test", baseFetch);
+
+  const res = await safeFetch("http://a.test/start", {
+    headers: { "OPEN-SANDBOX-API-KEY": "tenant-secret" },
+  });
+  assert.equal(res.status, 302);
+  assert.equal(calls.length, 1);
+});
+
 test("same-origin redirect preserves protected headers", async () => {
   let finalHeaders;
   const server = await startServer((req, res) => {
@@ -346,6 +415,8 @@ test("a status-0 response without an inspectable target fails closed", async () 
 });
 
 test("requests without protected headers pass opaque responses through", async () => {
+  // Disable the client-IP guard so nothing needs protection on this request.
+  _resetClientIpCacheForTest();
   const opaqueRedirect = { status: 0, type: "opaqueredirect", headers: new Headers() };
   const safeFetch = createRedirectSafeFetch("http://a.test", async () => opaqueRedirect);
 
@@ -450,6 +521,118 @@ test("cross-origin hops drop the client-IP header added by the transport", async
   } finally {
     await connectionConfig.closeTransport();
     _resetClientIpCacheForTest();
+    await source.close();
+    await target.close();
+  }
+});
+
+test("guards a transport-injected client-IP without caller protected headers", async () => {
+  let sourceHeaders;
+  let targetHeaders;
+  const target = await startServer((req, res) => {
+    targetHeaders = req.headers;
+    res.writeHead(200, { "content-type": "text/plain" });
+    res.end("ok");
+  });
+  const source = await startServer((req, res) => {
+    sourceHeaders = req.headers;
+    res.writeHead(302, { location: `${target.origin}/ping` });
+    res.end();
+  });
+
+  _setClientIpForTest("10.9.8.7");
+  const connectionConfig = new ConnectionConfig({ domain: "unused.test" }).withTransportIfMissing();
+  try {
+    // No protected headers from the caller: only the transport-injected
+    // client-IP makes this request need the guard.
+    const execd = new DefaultAdapterFactory().createExecdStack({
+      connectionConfig,
+      execdBaseUrl: source.origin,
+    });
+
+    assert.equal(await execd.health.ping(), true);
+    assert.equal(sourceHeaders["open-sandbox-client-ip"], "10.9.8.7");
+    assert.equal(targetHeaders["open-sandbox-client-ip"], undefined);
+  } finally {
+    await connectionConfig.closeTransport();
+    _resetClientIpCacheForTest();
+    await source.close();
+    await target.close();
+  }
+});
+
+test("same-origin redirect chains keep the client-IP on every hop", async () => {
+  const hops = [];
+  const server = await startServer((req, res) => {
+    hops.push({ url: req.url, clientIp: req.headers["open-sandbox-client-ip"] });
+    if (req.url === "/ping") {
+      res.writeHead(302, { location: "/ping2" });
+      res.end();
+      return;
+    }
+    if (req.url === "/ping2") {
+      res.writeHead(302, { location: "/ping3" });
+      res.end();
+      return;
+    }
+    res.writeHead(200, { "content-type": "text/plain" });
+    res.end("ok");
+  });
+
+  _setClientIpForTest("10.9.8.7");
+  const connectionConfig = new ConnectionConfig({ domain: "unused.test" }).withTransportIfMissing();
+  try {
+    const execd = new DefaultAdapterFactory().createExecdStack({
+      connectionConfig,
+      execdBaseUrl: server.origin,
+      endpointHeaders: { "OPENSANDBOX-EGRESS-AUTH": "egress-secret" },
+    });
+
+    assert.equal(await execd.health.ping(), true);
+    assert.equal(hops.length, 3);
+    for (const hop of hops) {
+      assert.equal(hop.clientIp, "10.9.8.7");
+    }
+  } finally {
+    await connectionConfig.closeTransport();
+    _resetClientIpCacheForTest();
+    await server.close();
+  }
+});
+
+test("isolated file uploads never follow redirects and surface the 3xx", async () => {
+  let targetHit = false;
+  const target = await startServer((req, res) => {
+    targetHit = true;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end("{}");
+  });
+  const source = await startServer((req, res) => {
+    res.writeHead(302, {
+      location: `${target.origin}/v1/isolated/session/s1/files/upload`,
+    });
+    res.end();
+  });
+
+  try {
+    const opts = {
+      baseUrl: source.origin,
+      sessionId: "s1",
+      headers: { "OPEN-SANDBOX-API-KEY": "tenant-secret" },
+      fetch,
+    };
+    const adapter = new IsolatedFilesystemAdapter(createExecdClient(opts), opts);
+
+    await assert.rejects(
+      () => adapter.writeFiles([{ path: "/tmp/a.txt", data: "hello" }]),
+      (err) => {
+        assert.ok(err instanceof SandboxApiException);
+        assert.equal(err.statusCode, 302);
+        return true;
+      },
+    );
+    assert.equal(targetHit, false);
+  } finally {
     await source.close();
     await target.close();
   }

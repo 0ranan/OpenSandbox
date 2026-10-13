@@ -62,3 +62,94 @@ test("code-interpreter requests strip protected headers on cross-origin redirect
   assert.equal(calls[1].url, "http://other.example/final");
   assert.equal(calls[1].headers["open-sandbox-api-key"], undefined);
 });
+
+test("streaming run() strips protected headers on cross-origin redirects", async () => {
+  const calls = [];
+  const fetchImpl = async (input, init = {}) => {
+    const request = input instanceof Request ? input : new Request(input, init);
+    calls.push({
+      url: request.url,
+      headers: Object.fromEntries(request.headers.entries()),
+    });
+
+    if (new URL(request.url).origin === "http://sandbox.internal:3456") {
+      return new Response(null, {
+        status: 302,
+        headers: { location: "http://other.example/stream" },
+      });
+    }
+    return new Response(
+      [
+        JSON.stringify({ type: "stdout", text: "hi", timestamp: 1 }),
+        JSON.stringify({ type: "execution_complete", execution_time: 1, timestamp: 2 }),
+      ].join("\n"),
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+  };
+
+  const sandbox = {
+    connectionConfig: {
+      headers: {},
+      fetch: fetchImpl,
+      sseFetch: fetchImpl,
+    },
+  };
+
+  const codes = new DefaultAdapterFactory().createCodes({
+    sandbox,
+    execdBaseUrl: "http://sandbox.internal:3456",
+    endpointHeaders: { "OPEN-SANDBOX-API-KEY": "tenant-secret" },
+  });
+
+  const execution = await codes.run("print('hi')");
+  assert.equal(execution.logs.stdout[0]?.text, "hi");
+
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].headers["open-sandbox-api-key"], "tenant-secret");
+  assert.equal(calls[1].url, "http://other.example/stream");
+  assert.equal(calls[1].headers["open-sandbox-api-key"], undefined);
+});
+
+test("same-origin redirects preserve the credential", async () => {
+  const calls = [];
+  const fetchImpl = async (input, init = {}) => {
+    const request = input instanceof Request ? input : new Request(input, init);
+    calls.push({
+      url: request.url,
+      headers: Object.fromEntries(request.headers.entries()),
+    });
+
+    if (calls.length === 1) {
+      return new Response(null, {
+        status: 302,
+        headers: { location: "http://sandbox.internal:3456/code/context2" },
+      });
+    }
+    return new Response(JSON.stringify({ id: "ctx-1", language: "python" }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+
+  const sandbox = {
+    connectionConfig: {
+      headers: {},
+      fetch: fetchImpl,
+      sseFetch: fetchImpl,
+    },
+  };
+
+  const codes = new DefaultAdapterFactory().createCodes({
+    sandbox,
+    execdBaseUrl: "http://sandbox.internal:3456",
+    endpointHeaders: { "OPEN-SANDBOX-API-KEY": "tenant-secret" },
+  });
+
+  const context = await codes.createContext("python");
+  assert.equal(context.id, "ctx-1");
+
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].url, "http://sandbox.internal:3456/code/context2");
+  // Same-origin hop keeps the credential.
+  assert.equal(calls[1].headers["open-sandbox-api-key"], "tenant-secret");
+});

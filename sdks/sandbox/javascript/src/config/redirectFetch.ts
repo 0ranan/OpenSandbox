@@ -13,6 +13,7 @@
 // limitations under the License.
 
 import { SandboxApiException } from "../core/exceptions.js";
+import { willInjectClientIp } from "./clientIp.js";
 import { SUPPRESS_CLIENT_IP } from "./connection.js";
 
 /**
@@ -25,10 +26,9 @@ import { SUPPRESS_CLIENT_IP } from "./connection.js";
  * reproduces that behavior with `redirect: "manual"` plus a manual redirect
  * loop.
  *
- * To keep the blast radius small, the new path is only taken when the outgoing
- * request actually carries a protected header. Requests without any protected
- * header are passed straight through to the underlying `fetch` and keep their
- * existing (default) redirect behavior.
+ * Requests that can carry a protected header — either a caller-supplied one or
+ * the transport-injected `OPEN-SANDBOX-CLIENT-IP` — take the guarded path.
+ * Everything else is passed straight through to the underlying `fetch`.
  */
 
 /** Header name prefixes whose values must not be replayed to another origin. */
@@ -54,6 +54,9 @@ const DEFAULT_PORTS: Readonly<Record<string, string>> = {
   "https:": "443",
 };
 
+/** Only these schemes are followed, matching native HTTP-redirect fetching. */
+const FOLLOWABLE_PROTOCOLS: ReadonlySet<string> = new Set(["http:", "https:"]);
+
 const REDIRECT_STATUSES: ReadonlySet<number> = new Set([
   301, 302, 303, 307, 308,
 ]);
@@ -65,6 +68,17 @@ export interface RedirectSafeFetchOptions {
    * Maximum number of redirects to follow before failing. Defaults to 20.
    */
   maxRedirects?: number;
+  /**
+   * Overall deadline for the whole redirect chain, in milliseconds. Each hop
+   * re-enters the transport (and re-arms its per-request timeout), so without
+   * an overall budget a long chain could run much longer than one request.
+   */
+  overallTimeoutMs?: number;
+}
+
+/** True when a response is an opaque (browser) redirect we cannot inspect. */
+export function isOpaqueRedirect(response: Response): boolean {
+  return response.type === "opaqueredirect" || response.status === 0;
 }
 
 /** True when at least one header name carries a protected prefix (case-insensitive). */
@@ -137,6 +151,24 @@ function resolveUrl(url: string): URL | undefined {
   }
 }
 
+/** Abort when either input aborts; prefers the native combinator when available. */
+function combineSignals(
+  a: AbortSignal | undefined,
+  b: AbortSignal | undefined,
+): AbortSignal | undefined {
+  if (!a) return b;
+  if (!b) return a;
+  const any = (AbortSignal as unknown as { any?: (signals: AbortSignal[]) => AbortSignal }).any;
+  if (typeof any === "function") return any([a, b]);
+  const controller = new AbortController();
+  const relay = (signal: AbortSignal) => controller.abort(signal.reason);
+  for (const signal of [a, b]) {
+    if (signal.aborted) relay(signal);
+    else signal.addEventListener("abort", () => relay(signal), { once: true });
+  }
+  return controller.signal;
+}
+
 /**
  * Wrap `baseFetch` so protected OpenSandbox headers are stripped before
  * following a redirect whose target origin differs from `baseUrl`'s origin.
@@ -155,29 +187,33 @@ export function createRedirectSafeFetch(
     return baseFetch;
   }
   const maxRedirects = opts.maxRedirects ?? DEFAULT_MAX_REDIRECTS;
+  const overallTimeoutMs = opts.overallTimeoutMs;
 
   return async function redirectSafeFetch(
     input: RequestInfo | URL,
     init?: RequestInit,
   ): Promise<Response> {
-    // An explicit non-following redirect mode is authoritative: the caller
-    // (e.g. file uploads) has opted out of following redirects entirely, so
-    // there is nothing to strip in transit.
-    if (init?.redirect === "manual" || init?.redirect === "error") {
-      return baseFetch(input, init);
-    }
-
     const request =
       typeof Request !== "undefined" && input instanceof Request ? input : undefined;
-    const initialHeaders: HeadersInit | undefined = init?.headers ?? request?.headers;
 
-    // Fast path: nothing sensitive is at stake, keep default fetch behavior.
-    if (!hasProtectedHeaders(new Headers(initialHeaders))) {
+    // An explicit non-following redirect mode is authoritative, whether it was
+    // passed via init or set on the Request input (openapi-fetch passes
+    // Request objects). File uploads rely on this to opt out of following.
+    const redirectMode = init?.redirect ?? request?.redirect;
+    if (redirectMode === "manual" || redirectMode === "error") {
       return baseFetch(input, init);
     }
 
-    // Other init fields (e.g. the undici `dispatcher` or `duplex`) are carried
-    // onto every hop; per-hop fields are overridden below.
+    const initialHeaders: HeadersInit | undefined = init?.headers ?? request?.headers;
+
+    // Fast path: guard only when the request can carry a protected header,
+    // either from the caller or injected by the transport below.
+    if (!hasProtectedHeaders(new Headers(initialHeaders)) && !willInjectClientIp()) {
+      return baseFetch(input, init);
+    }
+
+    // Other init fields (e.g. the undici `dispatcher`) are carried onto every
+    // hop; per-hop fields are overridden below.
     const baseInit: RequestInit = { ...(init ?? {}) };
 
     let currentUrl: string;
@@ -196,9 +232,12 @@ export function createRedirectSafeFetch(
         // can replay it: a Request body stream can otherwise be consumed once.
         try {
           body = await request.arrayBuffer();
-        } catch {
-          // The body is already disturbed/unreadable; fall back to native.
-          return baseFetch(input, init);
+        } catch (err) {
+          throw new SandboxApiException({
+            message:
+              "Cannot follow a redirect: the request body was already consumed and cannot be replayed.",
+            cause: err,
+          });
         }
       }
     } else {
@@ -208,10 +247,48 @@ export function createRedirectSafeFetch(
       body = init?.body;
     }
 
+    // A single deadline for the whole chain: native follow uses one budget,
+    // while each hop here re-enters the transport and re-arms its timeout.
+    const chainController = overallTimeoutMs ? new AbortController() : undefined;
+    const chainTimer = chainController
+      ? setTimeout(
+          () =>
+            chainController.abort(
+              new Error(`Redirect chain timed out (overallTimeoutMs=${overallTimeoutMs})`),
+            ),
+          overallTimeoutMs,
+        )
+      : undefined;
+    const hopSignal = combineSignals(signal, chainController?.signal);
+
     // Materialized lazily: until a redirect is actually followed the caller's
     // original header object is passed through unchanged.
     let headers: Headers | undefined;
     let suppressClientIp = false;
+
+    const buildHopInit = (
+      includeHeaders: boolean,
+      nextBody: BodyInit | null | undefined,
+    ): RequestInit => {
+      const hopInit: RequestInit = includeHeaders
+        ? {
+            ...baseInit,
+            method,
+            headers,
+            body: nextBody ?? undefined,
+            signal: hopSignal,
+            redirect: "manual",
+          }
+        : { ...baseInit, redirect: "manual" };
+      if (nextBody == null) {
+        // `duplex` is body-coupled; some runtimes reject it on a body-less hop.
+        delete (hopInit as Record<string, unknown>).duplex;
+      }
+      if (suppressClientIp) {
+        (hopInit as Record<PropertyKey, unknown>)[SUPPRESS_CLIENT_IP] = true;
+      }
+      return hopInit;
+    };
 
     let hopInit: RequestInit = request
       ? {
@@ -219,105 +296,112 @@ export function createRedirectSafeFetch(
           method,
           headers: initialHeaders,
           body: body ?? undefined,
-          signal,
+          signal: hopSignal,
           redirect: "manual",
         }
-      : // Preserve the caller's original init shape on the first hop.
-        { ...baseInit, redirect: "manual" };
+      : buildHopInit(false, body);
+    if (body == null) delete (hopInit as Record<string, unknown>).duplex;
 
-    for (let hop = 0; ; hop++) {
-      const response = await baseFetch(currentUrl, hopInit);
+    try {
+      for (let hop = 0; ; hop++) {
+        const response = await baseFetch(currentUrl, hopInit);
 
-      // Browsers expose `redirect: "manual"` as an opaque response (status 0,
-      // empty headers), so the redirect target cannot be inspected. Fail closed
-      // instead of risking a credential replay. This MUST be checked before the
-      // status check: an opaque redirect reports status 0, which is not a
-      // redirect status and would otherwise be returned as-is.
-      if (response.type === "opaqueredirect" || response.status === 0) {
-        throw new SandboxApiException({
-          message:
-            "Refusing to follow a redirect for a request carrying protected OpenSandbox headers: " +
-            "the redirect target cannot be inspected in this runtime.",
-        });
-      }
+        // Browsers expose `redirect: "manual"` as an opaque response (status 0,
+        // empty headers), so the redirect target cannot be inspected. Fail
+        // closed instead of risking a credential replay. This MUST be checked
+        // before the status check: an opaque redirect reports status 0, which
+        // is not a redirect status and would otherwise be returned as-is.
+        if (isOpaqueRedirect(response)) {
+          throw new SandboxApiException({
+            message:
+              "Refusing to follow a redirect for a request carrying protected OpenSandbox headers: " +
+              "the redirect target cannot be inspected in this runtime.",
+          });
+        }
 
-      if (!isRedirectStatus(response.status)) {
-        return response;
-      }
-
-      const location = response.headers.get("location");
-      if (!location) {
-        return response;
-      }
-
-      const currentUrlObj = resolveUrl(currentUrl);
-      if (!currentUrlObj) {
-        return response;
-      }
-
-      let nextUrl: URL;
-      try {
-        nextUrl = new URL(location, currentUrlObj);
-      } catch {
-        return response;
-      }
-
-      headers ??= new Headers(initialHeaders);
-      if (!isSameOrigin(nextUrl, baseOrigin)) {
-        stripProtectedHeaders(headers);
-        // Mirror native fetch/httpx: standard credentials do not cross origins.
-        stripCredentialHeaders(headers);
-        suppressClientIp = true;
-      }
-
-      // Mirror the Fetch redirect method/body semantics: 303 and POST 301/302
-      // become GET without a body, while 307/308 preserve both.
-      const dropsBody =
-        response.status === 303 ||
-        ((response.status === 301 || response.status === 302) && method === "POST");
-
-      let nextMethod = method;
-      let nextBody: BodyInit | null | undefined;
-      if (dropsBody) {
-        nextMethod = method === "HEAD" ? "HEAD" : "GET";
-        nextBody = undefined;
-      } else {
-        if (body != null && !isReplayableBody(body)) {
-          // The body cannot be re-sent safely; surface the redirect instead of
-          // replaying an unrewindable body to another origin.
+        if (!isRedirectStatus(response.status)) {
           return response;
         }
-        nextBody = body;
-      }
 
-      if (nextBody == null) {
-        // A stale entity length/type would corrupt the redirected request.
-        headers.delete("content-length");
-        headers.delete("content-type");
-      }
+        const location = response.headers.get("location");
+        if (!location) {
+          return response;
+        }
 
-      if (hop >= maxRedirects) {
-        throw new SandboxApiException({
-          message:
-            `Too many redirects (>${maxRedirects}) while following a request with ` +
-            "protected OpenSandbox headers.",
-        });
-      }
+        const currentUrlObj = resolveUrl(currentUrl);
+        if (!currentUrlObj) {
+          return response;
+        }
 
-      method = nextMethod;
-      body = nextBody;
-      currentUrl = nextUrl.toString();
-      hopInit = {
-        ...baseInit,
-        method,
-        headers,
-        body: nextBody ?? undefined,
-        signal,
-        redirect: "manual",
-      };
-      if (suppressClientIp) {
-        (hopInit as Record<PropertyKey, unknown>)[SUPPRESS_CLIENT_IP] = true;
+        let nextUrl: URL;
+        try {
+          nextUrl = new URL(location, currentUrlObj);
+        } catch {
+          return response;
+        }
+
+        // Native fetch never follows a non-HTTP(S) Location; surface the 3xx.
+        if (!FOLLOWABLE_PROTOCOLS.has(nextUrl.protocol)) {
+          return response;
+        }
+
+        headers ??= new Headers(initialHeaders);
+        if (!isSameOrigin(nextUrl, baseOrigin)) {
+          stripProtectedHeaders(headers);
+          // Mirror native fetch/httpx: standard credentials do not cross origins.
+          stripCredentialHeaders(headers);
+          suppressClientIp = true;
+        }
+
+        // Mirror the Fetch redirect method/body semantics: 303 and POST 301/302
+        // become GET without a body, while 307/308 preserve both.
+        const dropsBody =
+          response.status === 303 ||
+          ((response.status === 301 || response.status === 302) && method === "POST");
+
+        let nextMethod = method;
+        let nextBody: BodyInit | null | undefined;
+        if (dropsBody) {
+          nextMethod = method === "HEAD" ? "HEAD" : "GET";
+          nextBody = undefined;
+        } else {
+          if (body != null && !isReplayableBody(body)) {
+            // The body cannot be re-sent safely; surface the redirect instead of
+            // replaying an unrewindable body to another origin.
+            return response;
+          }
+          nextBody = body;
+        }
+
+        if (nextBody == null) {
+          // A stale entity length/type would corrupt the redirected request.
+          headers.delete("content-length");
+          headers.delete("content-type");
+        }
+
+        if (hop >= maxRedirects) {
+          throw new SandboxApiException({
+            message:
+              `Too many redirects (>${maxRedirects}) while following a request with ` +
+              "protected OpenSandbox headers.",
+          });
+        }
+
+        // The redirect body is of no interest; release it so the connection can
+        // return to the keep-alive pool (native follow drains internally).
+        try {
+          await response.body?.cancel();
+        } catch {
+          // ignore
+        }
+
+        method = nextMethod;
+        body = nextBody;
+        currentUrl = nextUrl.toString();
+        hopInit = buildHopInit(true, nextBody);
       }
+    } finally {
+      if (chainTimer) clearTimeout(chainTimer);
     }
   };
 }
